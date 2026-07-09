@@ -60,7 +60,7 @@ import java.util.Random;
 public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperatingSystem> {
 
     // Front sensor setup used to collect perceived objects for CPMs.
-    private static final double VIEWING_ANGLE = 60d;
+    private static final double VIEWING_ANGLE = 360d;
     private static final double VIEWING_RANGE = 80d;
     // Send CPMs once per second, using MOSAIC simulation time in nanoseconds.
     private static final long CPM_INTERVAL = 1_000_000_000L;
@@ -85,6 +85,8 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
     private Pair<Double, Double> postProcessingAcceleration;
     private Pair<Double, Double> postProcessingHeading;
     private long cpmMessageCounter = 0;
+    private boolean wasInCommunicationZone = false;
+    private long communicationZoneEntryTime = -1L;
 
     @Override
     public void onStartup() {
@@ -143,6 +145,8 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
             return;
         }
 
+        writeEgoCpmJson(cpmJson);
+
         // Send CPM as a real MOSAIC ad-hoc V2X message on the CCH.
         MessageRouting routing = getOperatingSystem().getAdHocModule().createMessageRouting()
                 .channel(AdHocChannel.CCH)
@@ -157,6 +161,23 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
                 getConfiguration().minimalPayloadLength
         );
         getOperatingSystem().getAdHocModule().sendV2xMessage(cpmMessage);
+    }
+
+    private void writeEgoCpmJson(JsonObject cpmJson) {
+        try {
+            jsonParser.parseAndWriteJson(cpmJson.toString(), getEgoCpmJsonPath());
+        } catch (Exception e) {
+            getLog().infoSimTime(this, "Error while writing ego CPM json: {}", e.toString());
+        }
+    }
+
+    private String getEgoCpmJsonPath() {
+        File outputDirectory = new File(getConfiguration().jsonPath, "ego");
+        if (!outputDirectory.exists() && !outputDirectory.mkdirs()) {
+            getLog().infoSimTime(this, "Could not create ego JSON output directory: {}", outputDirectory.getAbsolutePath());
+        }
+
+        return new File(outputDirectory, getOs().getId() + ".json").getPath();
     }
 
     // Build one sender-side CPM JSON payload for transmission.
@@ -176,6 +197,7 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
         cpmJson.addProperty("sender_id", getOs().getId());
         cpmJson.addProperty("sender_alias", senderData.alias);
         cpmJson.addProperty("messageID", "cpm_" + cpmMessageCounter++);
+        cpmJson.addProperty("just_entered_communication_zone", justEnteredCommunicationZone());
         cpmJson.add("sender", createSenderJson(senderData));
         cpmJson.add("perceivedObjects", createPerceivedObjectsJson(senderData.cartesianPoint, perceivedVehicles));
 
@@ -300,6 +322,7 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
         vehicleAdditionalInformation.alias = data.alias;
         vehicleAdditionalInformation.speedMode = data.speedMode;
         vehicleAdditionalInformation.positionCartesian = data.cartesianPoint;
+        vehicleAdditionalInformation.justEnteredCommunicationZone = justEnteredCommunicationZone();
 
         try {
             camBuilder.position(data.position).
@@ -424,7 +447,8 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
                         + "\"acl_noise\":\"" + receiverData.accelerationNoise + "\","
                         + "\"hed\":\"" + receiverData.heading + "\","
                         + "\"hed_noise\":\"" + receiverData.headingNoise + "\","
-                        + "\"driversProfile\":\"" + receiverData.speedMode + "\""
+                        + "\"driversProfile\":\"" + receiverData.speedMode + "\","
+                        + "\"just_entered_communication_zone\":" + justEnteredCommunicationZone()
                         + "}";
 
                 return "{"
@@ -434,6 +458,7 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
                         + "\"sender_id\":\"" + cam.getRouting().getSource().getSourceName() + "\","
                         + "\"sender_alias\":\"" + vehicleAdditionalInformation.alias + "\","
                         + "\"messageID\":\"cam_" + cam.getId() + "\","
+                        + "\"just_entered_communication_zone\":" + vehicleAdditionalInformation.justEnteredCommunicationZone + ","
                         + "\"receiver\":" + receiverJSON + ","
                         + "\"sender\":" + senderJson
                         + "}";
@@ -442,7 +467,8 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
                     "\"rcvTime\":\"" + LocalDateTime.now() + "\"," +
                     "\"sendTime\":\"" + cam.getGenerationTime() + "\"," +
                     "\"sender\":\"" + cam.getRouting().getSource().getSourceName() + "\"," +
-                    "\"messageID\":\"cam_" + cam.getId() + "\"}";
+                    "\"messageID\":\"cam_" + cam.getId() + "\"," +
+                    "\"just_entered_communication_zone\":0}";
         }
         if (v2xMessage instanceof GenericV2xMessage genericV2xMessage) {
             // Decode CPM payload, add receiver-side fields, then write like CAM.
@@ -452,6 +478,24 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
             return cpmJson.toString();
         }
         return "{\"rcvTime\":\"" + LocalDateTime.now() + "\"}";
+    }
+
+    private int justEnteredCommunicationZone() {
+        boolean isInCommunicationZone = isInSimulationArea();
+        long now = getOperatingSystem().getSimulationTime();
+
+        if (!isInCommunicationZone) {
+            wasInCommunicationZone = false;
+            communicationZoneEntryTime = -1L;
+            return 0;
+        }
+
+        if (!wasInCommunicationZone) {
+            wasInCommunicationZone = true;
+            communicationZoneEntryTime = now;
+        }
+
+        return now - communicationZoneEntryTime <= 2_000_000_000L ? 1 : 0;
     }
 
     private String decodeCpmPayloadJson(GenericV2xMessage genericV2xMessage) {
@@ -484,6 +528,7 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
         receiverJson.addProperty("hed", receiverData.heading);
         receiverJson.addProperty("hed_noise", receiverData.headingNoise);
         receiverJson.addProperty("driversProfile", receiverData.speedMode.toString());
+        receiverJson.addProperty("just_entered_communication_zone", justEnteredCommunicationZone());
         return receiverJson;
     }
 

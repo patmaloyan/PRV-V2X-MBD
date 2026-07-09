@@ -9,12 +9,14 @@ from typing import Dict, Any
 import pandas as pd
 
 from data_structures import Parameters
-import data_processing
+from kalman_detector import process_kalman_folder
 
 
 def worker_process_json(input_file: str, option: int, params_dict: Dict[str, Any], source_file: str):
     """Worker for JSON-File Processing"""
     try:
+        import data_processing
+
         input_path = Path(input_file)
         params = Parameters(**params_dict)
         result = data_processing.process(input_path, option, params, pd.DataFrame(), source_file)
@@ -26,6 +28,8 @@ def worker_process_json(input_file: str, option: int, params_dict: Dict[str, Any
 def worker_process_parquet_group(parquet_file: str, option: int, params_dict: Dict[str, Any], source_file: str):
     """Worker for Parquet-Group Processing"""
     try:
+        import data_processing
+
         parquet_path = Path(parquet_file)
         params = Parameters(**params_dict)
         df_all = pd.read_parquet(parquet_path)
@@ -57,6 +61,7 @@ def evaluate_predictions(scenario_stats):
         'accuracy': (total_tp + total_tn) / total_messages if total_messages > 0 else 0,
         'precision': total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0,
         'recall': total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0,
+        'false_positive_rate': total_fp / (total_fp + total_tn) if (total_fp + total_tn) > 0 else 0,
     }
     aggregated_metrics['f1'] = (2 * aggregated_metrics['precision'] * aggregated_metrics['recall'] /
                                 (aggregated_metrics['precision'] + aggregated_metrics['recall'])
@@ -67,7 +72,7 @@ def evaluate_predictions(scenario_stats):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_folder", help="Pfad zu den Eingabedateien", required=True)
-    parser.add_argument("--type", help="0 = catch-checks, 1 = legacy checks", required=True)
+    parser.add_argument("--type", help="0 = catch-checks, 1 = legacy checks, 2 = CAM-only Kalman", required=True)
     parser.add_argument("--train", type=float)
     parser.add_argument("--parameter", required=False,default=None)
     parser.add_argument('--mpr', required=False, type=float)
@@ -135,6 +140,28 @@ def main():
     params_dict = vars(params)
     count = 0
     max_workers = args.workers
+
+    if int(args.type) == 2:
+        metrics, debug_results = process_kalman_folder(input_folder)
+        scenario_stats.append(metrics)
+        aggregated_metrics = evaluate_predictions(scenario_stats)
+        for key in ["wireless_range_m", "range_margin_m", "total_messages"]:
+            aggregated_metrics[key] = metrics.get(key)
+        print(aggregated_metrics['f1'])
+
+        if args.train == 0:
+            output_dir = input_folder.parent / "results"
+            output_dir.mkdir(exist_ok=True)
+            output_file = output_dir / f"{input_folder.name}_kalman_cam_only_predicted.json"
+            debug_file = output_dir / f"{input_folder.name}_kalman_cam_only_debug.json"
+            print(f"Saved in {output_file}")
+            with open(output_file, 'w') as f:
+                json.dump(aggregated_metrics, f, indent=4)
+            # Kalman debug output: one compact row per CAM decision for FP/rejection analysis.
+            with open(debug_file, 'w') as f:
+                json.dump(debug_results.where(pd.notnull(debug_results), None).to_dict(orient='records'), f, indent=4)
+            print(f"Saved debug in {debug_file}")
+        return
 
     print(f"Starting processing with {max_workers} workers...", file=sys.stderr)
 

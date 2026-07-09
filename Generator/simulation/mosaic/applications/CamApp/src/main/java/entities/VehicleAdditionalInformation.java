@@ -13,4 +13,5 @@ public class VehicleAdditionalInformation implements Serializable {
     public long alias;
     public SpeedMode speedMode;
     public CartesianPoint positionCartesian;
+    public int justEnteredCommunicationZone;
 }

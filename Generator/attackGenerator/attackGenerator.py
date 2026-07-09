@@ -6,6 +6,7 @@ from typing import Tuple
 import pandas as pd
 import random
 import numpy as np
+import shutil
 from pathlib import Path
 
 ATTACK_RATIO = 0.2
@@ -100,13 +101,14 @@ def random_float_with_intervals(pos_min, pos_max, neg_min, neg_max):
 
 
 def reconstruct_nested(row):
-    return {
+    msg = {
         'type': row.get('type', 'CAM'),
         'rcvTime': row['rcvTime'],
         'sendTime': row['sendTime'],
         'sender_id': row['sender_id'],
         'sender_alias': row['sender_alias'],
         'messageID': row['messageID'],
+        'just_entered_communication_zone': row.get('just_entered_communication_zone', 0),
         'attacker': row['attacker'],
         'receiver': {
             'pos': f"{row['receiver_pos_lat']},{row['receiver_pos_lon']},{row['receiver_pos_alt']}",
@@ -117,7 +119,8 @@ def reconstruct_nested(row):
             'acl_noise': row['receiver_acl_noise'],
             'hed': row['receiver_hed'],
             'hed_noise': row['receiver_hed_noise'],
-            'driversProfile': row['receiver_driversProfile']
+            'driversProfile': row['receiver_driversProfile'],
+            'just_entered_communication_zone': row.get('receiver_just_entered_communication_zone', 0)
         },
         'sender': {
             'pos': f"{row['sender_pos_lat']},{row['sender_pos_lon']},{row['sender_pos_alt']}",
@@ -131,6 +134,8 @@ def reconstruct_nested(row):
             'driversProfile': row['sender_driversProfile']
         }
     }
+
+    return msg
 
 
 def reconstruct_cpm_nested(row):
@@ -629,6 +634,9 @@ def prepare_message_dataframe(data, message_type):
     df['sender_id'] = df['sender_id'].astype(str)
     df['sender_alias'] = df['sender_alias'].astype(int)
     df['messageID'] = df['messageID'].apply(lambda value: normalize_message_id(value, message_type))
+    if 'just_entered_communication_zone' not in df.columns:
+        df['just_entered_communication_zone'] = 0
+    df['just_entered_communication_zone'] = df['just_entered_communication_zone'].fillna(0).astype(int)
 
     # Receiver fields
     df['receiver_pos'] = df['receiver_pos'].astype(str)
@@ -640,6 +648,9 @@ def prepare_message_dataframe(data, message_type):
     df['receiver_hed'] = df['receiver_hed'].astype(float)
     df['receiver_hed_noise'] = df['receiver_hed_noise'].astype(float)
     df['receiver_driversProfile'] = df['receiver_driversProfile'].astype(str)
+    if 'receiver_just_entered_communication_zone' not in df.columns:
+        df['receiver_just_entered_communication_zone'] = 0
+    df['receiver_just_entered_communication_zone'] = df['receiver_just_entered_communication_zone'].fillna(0).astype(int)
 
     # Sender fields
     df['sender_pos'] = df['sender_pos'].astype(str)
@@ -814,6 +825,15 @@ def process_cpm_file(json_file):
         json.dump(nested_data, f, indent=4)
 
 
+def copy_ego_file(json_file):
+    # Ego CPM snapshots are local sensor evidence; keep non-attacker ego files unchanged.
+    if json_file.stem in attackerIDs:
+        return False
+
+    shutil.copy2(json_file, output_dir / 'ego' / json_file.name)
+    return True
+
+
 def set_up_misbehavior_config():
     if args.misbehavior == "mixAll":
         assignments = assign_misbehaviors_to_attackers(attackerIDs, available_misbehaviors)
@@ -922,11 +942,14 @@ if __name__ == "__main__":
     # CPM-addition: support datasets split into cam/ and cpm/ folders.
     cam_input_dir = input_folder / 'cam' if (input_folder / 'cam').is_dir() else input_folder
     cpm_input_dir = input_folder / 'cpm' if (input_folder / 'cpm').is_dir() else None
+    ego_input_dir = input_folder / 'ego' if (input_folder / 'ego').is_dir() else None
     cam_output_dir = output_dir / 'cam' if cpm_input_dir is not None else output_dir
     output_dir.mkdir(exist_ok=True)
     cam_output_dir.mkdir(exist_ok=True)
     if cpm_input_dir is not None:
         (output_dir / 'cpm').mkdir(exist_ok=True)
+    if ego_input_dir is not None:
+        (output_dir / 'ego').mkdir(exist_ok=True)
 
     for json_file in cam_input_dir.glob('*.json'):
         with open(json_file, 'r') as f:
@@ -946,6 +969,9 @@ if __name__ == "__main__":
     df_all['sendTime'] = df_all['sendTime'].astype(int)
     df_all['sender_id'] = df_all['sender_id'].astype(str)
     df_all['sender_alias'] = df_all['sender_alias'].astype(int)
+    if 'just_entered_communication_zone' not in df_all.columns:
+        df_all['just_entered_communication_zone'] = 0
+    df_all['just_entered_communication_zone'] = df_all['just_entered_communication_zone'].fillna(0).astype(int)
 
     # Receiver Felder
     df_all['receiver_pos'] = df_all['receiver_pos'].astype(str)
@@ -957,6 +983,9 @@ if __name__ == "__main__":
     df_all['receiver_hed'] = df_all['receiver_hed'].astype(float)
     df_all['receiver_hed_noise'] = df_all['receiver_hed_noise'].astype(float)
     df_all['receiver_driversProfile'] = df_all['receiver_driversProfile'].astype(str)
+    if 'receiver_just_entered_communication_zone' not in df_all.columns:
+        df_all['receiver_just_entered_communication_zone'] = 0
+    df_all['receiver_just_entered_communication_zone'] = df_all['receiver_just_entered_communication_zone'].fillna(0).astype(int)
 
     # Sender Felder
     df_all['sender_pos'] = df_all['sender_pos'].astype(str)
@@ -1048,6 +1077,16 @@ if __name__ == "__main__":
         for index, json_file in enumerate(cpm_files_to_process, start=1):
             process_cpm_file(json_file)
             print(f"Processing CPM consistency for file {index}/{len(cpm_files_to_process)}: {json_file.name}")
+
+    if ego_input_dir is not None:
+        ego_files_to_process = [f for f in ego_input_dir.glob('*.json')
+                                if not f.stem.endswith(tuple(misbehaviorOptions))]
+        copied_count = 0
+        for index, json_file in enumerate(ego_files_to_process, start=1):
+            if copy_ego_file(json_file):
+                copied_count += 1
+            print(f"Copying ego sensor file {index}/{len(ego_files_to_process)}: {json_file.name}")
+        print(f"[OK] Copied {copied_count}/{len(ego_files_to_process)} ego files; attacker ego files skipped")
 
     if needs_sumo:
         stop_sumo()

@@ -463,3 +463,4 @@ pyrightconfig.json
 # End of https://www.toptal.com/developers/gitignore/api/jetbrains,intellij,pycharm,java,python
 
 Simulation-Test
+Generator/docker

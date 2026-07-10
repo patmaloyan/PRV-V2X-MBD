@@ -9,7 +9,7 @@ from typing import Dict, Any
 import pandas as pd
 
 from data_structures import Parameters
-from kalman_detector import process_kalman_folder
+from kalman_detector import process_cam_cpm_kalman_folder, process_kalman_folder
 
 
 def worker_process_json(input_file: str, option: int, params_dict: Dict[str, Any], source_file: str):
@@ -72,7 +72,11 @@ def evaluate_predictions(scenario_stats):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_folder", help="Pfad zu den Eingabedateien", required=True)
-    parser.add_argument("--type", help="0 = catch-checks, 1 = legacy checks, 2 = CAM-only Kalman", required=True)
+    parser.add_argument(
+        "--type",
+        help="0 = catch-checks, 1 = legacy checks, 2 = CAM-only Kalman, 3 = CAM+CPM Kalman",
+        required=True,
+    )
     parser.add_argument("--train", type=float)
     parser.add_argument("--parameter", required=False,default=None)
     parser.add_argument('--mpr', required=False, type=float)
@@ -158,6 +162,31 @@ def main():
             with open(output_file, 'w') as f:
                 json.dump(aggregated_metrics, f, indent=4)
             # Kalman debug output: one compact row per CAM decision for FP/rejection analysis.
+            with open(debug_file, 'w') as f:
+                json.dump(debug_results.where(pd.notnull(debug_results), None).to_dict(orient='records'), f, indent=4)
+            print(f"Saved debug in {debug_file}")
+        return
+
+    if int(args.type) == 3:
+        # Type 3 adds the CPM perceived-object branch while preserving type 2 as CAM-only.
+        metrics, debug_results = process_cam_cpm_kalman_folder(input_folder)
+        scenario_stats.append(metrics)
+        aggregated_metrics = evaluate_predictions(scenario_stats)
+        for key in [
+            "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
+            "total_messages", "cam_messages", "cpm_messages",
+        ]:
+            aggregated_metrics[key] = metrics.get(key)
+        print(aggregated_metrics['f1'])
+
+        if args.train == 0:
+            output_dir = input_folder.parent / "results"
+            output_dir.mkdir(exist_ok=True)
+            output_file = output_dir / f"{input_folder.name}_kalman_cam_cpm_predicted.json"
+            debug_file = output_dir / f"{input_folder.name}_kalman_cam_cpm_debug.json"
+            print(f"Saved in {output_file}")
+            with open(output_file, 'w') as f:
+                json.dump(aggregated_metrics, f, indent=4)
             with open(debug_file, 'w') as f:
                 json.dump(debug_results.where(pd.notnull(debug_results), None).to_dict(orient='records'), f, indent=4)
             print(f"Saved debug in {debug_file}")

@@ -78,6 +78,8 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
     private double randomTime;
     private CartesianPoint lastPosition;
     private LocalDateTime initialTime = LocalDateTime.now();
+    // ADDITION: previous Eclipse logic used real time; pseudonym changes now use simulation time.
+    private long initialSimulationTime = 0L;
     private DriverProfile driverProfile;
 
     private Pair<MutableCartesianPoint, MutableCartesianPoint> postProcessingPoint;
@@ -85,6 +87,7 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
     private Pair<Double, Double> postProcessingAcceleration;
     private Pair<Double, Double> postProcessingHeading;
     private long cpmMessageCounter = 0;
+    private long cpmInitialOffset;
     private boolean wasInCommunicationZone = false;
     private long communicationZoneEntryTime = -1L;
 
@@ -98,7 +101,10 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
                 new SimplePerceptionConfiguration.Builder(VIEWING_ANGLE, VIEWING_RANGE).build()
         );
         getLog().infoSimTime(this, "Perception enabled with angle {} deg and range {} m", VIEWING_ANGLE, VIEWING_RANGE);
-        scheduleNextCpmEvent();
+        // Give each vehicle a fixed random CPM phase so transmissions do not all occur on .000.
+        cpmInitialOffset = 1L + (long) (Math.random() * CPM_INTERVAL);
+        scheduleInitialCpmEvent();
+        initialSimulationTime = getOperatingSystem().getSimulationTime();
         
         if (getConfiguration().enableDriverProfiles) {
             Random rand = new Random();
@@ -118,7 +124,14 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
         firstSample();
     }
 
-    // Schedule the next 1 Hz CPM generation event for this sender vehicle.
+    // Apply the random phase only to the first CPM event.
+    private void scheduleInitialCpmEvent() {
+        getOperatingSystem().getEventManager().addEvent(
+                getOperatingSystem().getSimulationTime() + cpmInitialOffset, this::generateCpm
+        );
+    }
+
+    // Keep the selected phase by scheduling every later CPM exactly one second apart.
     private void scheduleNextCpmEvent() {
         // CPM generation is independent of CAM generation and receive events.
         getOperatingSystem().getEventManager().addEvent(
@@ -345,31 +358,30 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
 
     @Override
     public void onMessageTransmitted(V2xMessageTransmission v2xMessageTransmission) {
-        distanceDrivenSinceLastChange += this.data.projectedPosition.distanceTo(lastPosition);
-        LocalDateTime now = LocalDateTime.now();
-        if (firstChange) {
-            if (!randomDistanceSet) {
-                randomDistance =  800 + (1500 - 800) * Math.random();
-                randomDistanceSet = true;
-            }
-            if (distanceDrivenSinceLastChange > randomDistance) {
-                data.alias = (long) ((Math.random() * 9_000_000_000L) + 1_000_000_000L);
-                distanceDrivenSinceLastChange = 0;
-                firstChange = false;
-            }
-        } else {
-            if (distanceDrivenSinceLastChange > randomDistance) {
-                if (!randomTimeSet) {
-                    randomTime =  120000 + (360000 - 120000) * Math.random();
-                    randomTimeSet = true;
-                }
-                if (Duration.between(initialTime, now).toMillis() > randomTime) {
-                    data.alias = (long) ((Math.random() * 9_000_000_000L) + 1_000_000_000L);
-                    distanceDrivenSinceLastChange = 0;
-                    initialTime = now;
-                    randomTimeSet = false;
-                }
-            }
+//        distanceDrivenSinceLastChange += this.data.projectedPosition.distanceTo(lastPosition);
+//        if (firstChange) {
+//            if (!randomDistanceSet) {
+//                randomDistance =  800 + (1500 - 800) * Math.random();
+//                randomDistanceSet = true;
+//            }
+//            if (distanceDrivenSinceLastChange > randomDistance) {
+//                data.alias = (long) ((Math.random() * 9_000_000_000L) + 1_000_000_000L);
+//                distanceDrivenSinceLastChange = 0;
+//                firstChange = false;
+//            }
+//        }
+
+        if (!randomTimeSet) {
+            // Previous randomized interval: 100 s to 200 s.
+            // randomTime = 100_000_000_000L + (200_000_000_000L - 100_000_000_000L) * Math.random();
+            randomTime = 100_000_000_000L;
+            randomTimeSet = true;
+        }
+
+        if (getOperatingSystem().getSimulationTime() - initialSimulationTime > randomTime) {
+            data.alias = (long) ((Math.random() * 9_000_000_000L) + 1_000_000_000L);
+            initialSimulationTime = getOperatingSystem().getSimulationTime();
+            randomTimeSet = false;
         }
     }
 

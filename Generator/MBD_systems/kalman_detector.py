@@ -7,11 +7,12 @@ import pandas as pd
 from kalman_filter import KalmanTrack, parse_position
 
 
-POSITION_THRESHOLD_M = 7.5
-SPEED_THRESHOLD_MPS = 5.0
+POSITION_THRESHOLD_M = 10
+SPEED_THRESHOLD_MPS = 5
 WIRELESS_RANGE_M = 300.0
 RANGE_MARGIN_M = 50.0
 EGO_LOOKBACK_NS = 2_000_000_000
+CPM_SENSOR_RANGE_M = 80.0
 
 
 class CamOnlyKalmanDetector:
@@ -158,6 +159,111 @@ class CamOnlyKalmanDetector:
         return None
 
 
+class CamCpmKalmanDetector(CamOnlyKalmanDetector):
+    """Tsukada detector using one time-ordered CAM/CPM stream per receiver."""
+
+    def __init__(self):
+        super().__init__()
+        self.anonymous_track_counter = 0
+
+    def process_receiver(self, cam_path: Path | None, cpm_path: Path | None, ego_path: Path | None):
+        # CAMs and CPMs received by this vehicle share one chronological track history.
+        messages = combined_message_frame(cam_path, cpm_path)
+        ego_snapshots = sorted(load_json_list(ego_path), key=lambda msg: int(msg["sendTime"]))
+        receiver_id = (cam_path or cpm_path).stem
+
+        rows = []
+        for message in messages.to_dict(orient="records"):
+            message_type = str(message["message_type"]).upper()
+            source_decision = self.process_cam(message, ego_snapshots)
+            object_counts = empty_object_counts()
+            if message_type == "CPM":
+                perceived_objects = message.get("perceivedObjects", [])
+                # The orange flowchart branch runs only after the CPM source is accepted.
+                if source_decision["accepted"]:
+                    object_counts = self.process_perceived_objects(message)
+                elif isinstance(perceived_objects, list):
+                    # Count skipped objects so debug totals still reconcile with raw CPM data.
+                    object_counts["cpm_objects_observed"] = len(perceived_objects)
+                    object_counts["cpm_objects_source_rejected"] = len(perceived_objects)
+                else:
+                    object_counts["cpm_objects_malformed"] = 1
+
+            rows.append({
+                "receiver_id": receiver_id,
+                "message_type": message_type,
+                "messageID": message.get("messageID"),
+                "sender_id": message.get("sender_id"),
+                "sender_alias": message.get("sender_alias", 0),
+                "sender_just_entered_communication_zone": sender_just_entered(message),
+                "receiver_just_entered_communication_zone": receiver_just_entered(message),
+                "sendTime": int(message.get("sendTime", 0)),
+                "rcvTime": int(message.get("rcvTime", 0)),
+                "attacker": int(message.get("attacker", 0)),
+                "prediction": 0 if source_decision["accepted"] else 1,
+                **source_decision,
+                **object_counts,
+            })
+
+        return pd.DataFrame(rows)
+
+    def process_perceived_objects(self, cpm: dict):
+        counts = empty_object_counts()
+        objects = cpm.get("perceivedObjects", [])
+        if not isinstance(objects, list):
+            counts["cpm_objects_malformed"] = 1
+            return counts
+
+        counts["cpm_objects_observed"] = len(objects)
+        for perceived_object in objects:
+            object_id = perceived_object.get("object_id") if isinstance(perceived_object, dict) else None
+            measurement = perceived_object_as_cam(perceived_object, int(cpm["rcvTime"]))
+            if measurement is None:
+                counts["cpm_objects_malformed"] += 1
+                counts["cpm_object_events"].append({"object_id": object_id, "action": "malformed"})
+                continue
+
+            best_track, pos_error, speed_error = self.closest_track(measurement)
+            # object_id is simulation ground truth; association uses only Kalman deviation.
+            if best_track is not None and errors_within_threshold(pos_error, speed_error):
+                best_track.update_from_cam(measurement, self.measurement_noise)
+                counts["cpm_objects_matched"] += 1
+                counts["cpm_object_events"].append({"object_id": object_id, "action": "matched"})
+                continue
+
+            if not perceived_object_within_sensor_range(perceived_object):
+                counts["cpm_objects_out_of_range"] += 1
+                counts["cpm_object_events"].append({"object_id": object_id, "action": "out_of_range"})
+                continue
+
+            self.add_anonymous_object_track(measurement)
+            counts["cpm_objects_initialized"] += 1
+            counts["cpm_object_events"].append({"object_id": object_id, "action": "initialized"})
+
+        return counts
+
+    def closest_track(self, measurement: dict):
+        best_track = None
+        best_pos_error = None
+        best_speed_error = None
+        best_score = float("inf")
+        for track in self.tracks:
+            pos_error, speed_error = track.errors_against_cam(measurement)
+            score = (pos_error / POSITION_THRESHOLD_M) + (speed_error / SPEED_THRESHOLD_MPS)
+            if score < best_score:
+                best_track = track
+                best_pos_error = pos_error
+                best_speed_error = speed_error
+                best_score = score
+        return best_track, best_pos_error, best_speed_error
+
+    def add_anonymous_object_track(self, measurement: dict):
+        self.anonymous_track_counter += 1
+        # Do not expose the CPM ground-truth object_id as an observable station identity.
+        measurement["sender_id"] = f"cpm_object_{self.anonymous_track_counter}"
+        track = KalmanTrack.from_cam(measurement, self.initial_covariance)
+        self.tracks.append(track)
+
 def process_kalman_folder(input_folder: Path):
     cam_dir = input_folder / "cam"
     ego_dir = input_folder / "ego"
@@ -179,6 +285,101 @@ def process_kalman_folder(input_folder: Path):
     metrics["range_margin_m"] = RANGE_MARGIN_M
     metrics["total_messages"] = int(len(results))
     return metrics, results
+
+
+def process_cam_cpm_kalman_folder(input_folder: Path):
+    cam_dir = input_folder / "cam"
+    cpm_dir = input_folder / "cpm"
+    ego_dir = input_folder / "ego"
+    if not cam_dir.is_dir() or not cpm_dir.is_dir():
+        raise ValueError(f"Type 3 expects CAM and CPM folders at {cam_dir} and {cpm_dir}")
+
+    cam_paths = {path.stem: path for path in cam_dir.glob("*.json")}
+    cpm_paths = {path.stem: path for path in cpm_dir.glob("*.json")}
+    receiver_ids = sorted(set(cam_paths) | set(cpm_paths))
+    if not receiver_ids:
+        raise ValueError(f"No CAM or CPM JSON files found in {input_folder}")
+
+    receiver_results = []
+    for receiver_id in receiver_ids:
+        ego_path = ego_dir / f"{receiver_id}.json" if ego_dir.is_dir() else None
+        # Kalman state is local to a receiver and must never leak between vehicles.
+        detector = CamCpmKalmanDetector()
+        receiver_results.append(detector.process_receiver(
+            cam_paths.get(receiver_id), cpm_paths.get(receiver_id), ego_path
+        ))
+
+    results = pd.concat(receiver_results, ignore_index=True)
+    metrics = calculate_metrics(results)
+    metrics["wireless_range_m"] = WIRELESS_RANGE_M
+    metrics["range_margin_m"] = RANGE_MARGIN_M
+    metrics["cpm_sensor_range_m"] = CPM_SENSOR_RANGE_M
+    metrics["total_messages"] = int(len(results))
+    metrics["cam_messages"] = int((results["message_type"] == "CAM").sum())
+    metrics["cpm_messages"] = int((results["message_type"] == "CPM").sum())
+    return metrics, results
+
+
+def combined_message_frame(cam_path: Path | None, cpm_path: Path | None):
+    records = []
+    for message_type, path in (("CAM", cam_path), ("CPM", cpm_path)):
+        for message in load_json_list(path):
+            row = dict(message)
+            row["message_type"] = message_type
+            records.append(row)
+    if not records:
+        return pd.DataFrame()
+    frame = pd.DataFrame(records)
+    frame["rcvTime"] = frame["rcvTime"].astype("int64")
+    frame["sendTime"] = frame["sendTime"].astype("int64")
+    # Stable secondary keys make equal-reception-time processing reproducible.
+    return frame.sort_values(
+        ["rcvTime", "sendTime", "messageID"], kind="mergesort", ignore_index=True
+    )
+
+
+def perceived_object_as_cam(perceived_object: dict, rcv_time: int):
+    if not isinstance(perceived_object, dict):
+        return None
+    required = ("global_pos", "spd", "hed")
+    if any(key not in perceived_object for key in required):
+        return None
+    try:
+        parse_position(perceived_object["global_pos"])
+        float(perceived_object["spd"])
+        float(perceived_object["hed"])
+    except (TypeError, ValueError, IndexError):
+        return None
+    return {
+        "sender_id": "",
+        "sender_alias": 0,
+        "rcvTime": int(rcv_time),
+        "sender": {
+            "pos": perceived_object["global_pos"],
+            "spd": perceived_object["spd"],
+            "hed": perceived_object["hed"],
+        },
+    }
+
+
+def perceived_object_within_sensor_range(perceived_object: dict):
+    try:
+        relative_position = parse_position(perceived_object["rel_pos"])
+    except (KeyError, TypeError, ValueError, IndexError):
+        return False
+    return float(np.linalg.norm(relative_position[0:2])) <= CPM_SENSOR_RANGE_M
+
+
+def empty_object_counts():
+    return {
+        "cpm_objects_observed": 0,
+        "cpm_objects_matched": 0,
+        "cpm_objects_initialized": 0,
+        "cpm_objects_out_of_range": 0,
+        "cpm_objects_source_rejected": 0,
+        "cpm_objects_malformed": 0,
+        "cpm_object_events": [],
+    }
 
 
 def calculate_metrics(results: pd.DataFrame):
@@ -213,7 +414,10 @@ def errors_within_threshold(pos_error, speed_error):
 
 
 def sender_just_entered(cam: dict):
-    return int(cam.get("just_entered_communication_zone", 0))
+    return int(cam.get(
+        "just_entered_communication_zone",
+        cam.get("just_entered_communication_zone_cpm", cam.get("just_entered_communication_zone_cam", 0)),
+    ))
 
 
 def receiver_just_entered(cam: dict):

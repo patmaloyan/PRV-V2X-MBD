@@ -7,8 +7,8 @@ import pandas as pd
 from kalman_filter import KalmanTrack, parse_position
 
 
-POSITION_THRESHOLD_M = 10
-SPEED_THRESHOLD_MPS = 5
+POSITION_THRESHOLD_M = 20
+SPEED_THRESHOLD_MPS = 10
 WIRELESS_RANGE_M = 300.0
 RANGE_MARGIN_M = 50.0
 EGO_LOOKBACK_NS = 2_000_000_000
@@ -226,7 +226,7 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
             best_track, pos_error, speed_error = self.closest_track(measurement)
             # object_id is simulation ground truth; association uses only Kalman deviation.
             if best_track is not None and errors_within_threshold(pos_error, speed_error):
-                best_track.update_from_cam(measurement, self.measurement_noise)
+                # CPM object data is indirect: it may confirm a track, but must not update it.
                 counts["cpm_objects_matched"] += 1
                 counts["cpm_object_events"].append({"object_id": object_id, "action": "matched"})
                 continue

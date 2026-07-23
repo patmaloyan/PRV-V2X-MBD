@@ -4,11 +4,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from kalman_filter import KalmanTrack, parse_position
+from Generator.MBD_systems.complex_kalman_types.kalman_filter import KalmanTrack as NisKalmanTrack
+from Generator.MBD_systems.complex_kalman_types.kalman_filter import measurement_gate as nis_measurement_gate
+from Generator.MBD_systems.complex_kalman_types.kalman_filter import parse_position
+from Generator.MBD_systems.complex_kalman_types.kalman_filter_fixed_gate import KalmanTrack as FixedGateKalmanTrack
+from Generator.MBD_systems.complex_kalman_types.kalman_filter_fixed_gate import measurement_gate as fixed_measurement_gate
+from Generator.MBD_systems.complex_kalman_types.kalman_filter_fixed_gate import POSITION_THRESHOLD_M, SPEED_THRESHOLD_MPS
 
 
-POSITION_THRESHOLD_M = 10
-SPEED_THRESHOLD_MPS = 5
 WIRELESS_RANGE_M = 300.0
 RANGE_MARGIN_M = 50.0
 EGO_LOOKBACK_NS = 2_000_000_000
@@ -16,11 +19,21 @@ CPM_SENSOR_RANGE_M = 80.0
 
 
 class CamOnlyKalmanDetector:
-    def __init__(self):
+    def __init__(self, kalman_type="nis"):
+        if kalman_type == "nis":
+            self.track_class = NisKalmanTrack
+            self.measurement_gate = nis_measurement_gate
+            self.gate_rank = lambda gate: gate.nis
+        elif kalman_type == "fixed":
+            self.track_class = FixedGateKalmanTrack
+            self.measurement_gate = fixed_measurement_gate
+            self.gate_rank = lambda gate: (
+                gate.position_error / POSITION_THRESHOLD_M + gate.speed_error / SPEED_THRESHOLD_MPS
+            )
+        else:
+            raise ValueError(f"Unknown kalman_type: {kalman_type}")
         self.tracks = []
         self.tracks_by_station_id = {}
-        self.initial_covariance = np.diag([25.0, 25.0, 9.0, 9.0])  # Initial x/y/vx/vy uncertainty.
-        self.measurement_noise = np.diag([9.0, 9.0, 4.0, 4.0])  # CAM x/y/vx/vy measurement noise.
 
     def process_receiver(self, cam_path: Path, ego_path: Path | None):
         cam_messages = sorted(load_json_list(cam_path), key=lambda msg: int(msg["rcvTime"]))
@@ -62,67 +75,57 @@ class CamOnlyKalmanDetector:
         if track is None:
             return None
 
-        pos_error, speed_error = track.errors_against_cam(cam)
-        if errors_within_threshold(pos_error, speed_error):
-            track.update_from_cam(cam, self.measurement_noise)
-            return decision(True, "known_id_accept", pos_error, speed_error, track.station_id)
+        gate = track.gate(cam)
+        if gate.accepted:
+            track.update_from_cam(cam)
+            return decision(True, "known_id_accept", track.station_id, gate)
 
-        return decision(False, "known_id_reject", pos_error, speed_error, track.station_id)
+        return decision(False, "known_id_reject", track.station_id, gate)
 
     def pseudonym_change_check(self, cam: dict):
         best_track = None
-        best_pos_error = None
-        best_speed_error = None
-        best_score = float("inf")
+        best_gate = None
 
+        # Associate an unknown station ID with the statistically closest track.
         for track in self.tracks:
-            pos_error, speed_error = track.errors_against_cam(cam)
-            score = (pos_error / POSITION_THRESHOLD_M) + (speed_error / SPEED_THRESHOLD_MPS)
-            if score < best_score:
+            gate = track.gate(cam)
+            if best_gate is None or self.gate_rank(gate) < self.gate_rank(best_gate):
                 best_track = track
-                best_pos_error = pos_error
-                best_speed_error = speed_error
-                best_score = score
+                best_gate = gate
 
-        if best_track is None or not errors_within_threshold(best_pos_error, best_speed_error):
+        if best_track is None or not best_gate.accepted:
             return None
 
         old_station_id = best_track.station_id
         self.tracks_by_station_id.pop(old_station_id, None)
         best_track.station_id = str(cam["sender_id"])
         self.tracks_by_station_id[best_track.station_id] = best_track
-        best_track.update_from_cam(cam, self.measurement_noise)
-        return decision(True, "pseudonym_accept", best_pos_error, best_speed_error, old_station_id)
+        best_track.update_from_cam(cam)
+        return decision(True, "pseudonym_accept", old_station_id, best_gate)
 
     def new_vehicle_check(self, cam: dict, ego_snapshots: list[dict]):
         # A new ID is accepted if it just entered, appears near range edge, or is seen by the receiver.
         if sender_just_entered(cam) == 1:
             self.add_track(cam)
-            return decision(True, "new_vehicle_sender_zone_entry_accept", None, None, None)
+            return decision(True, "new_vehicle_sender_zone_entry_accept", None)
 
         if receiver_just_entered(cam) == 1:
             self.add_track(cam)
-            return decision(True, "new_vehicle_receiver_zone_entry_accept", None, None, None)
+            return decision(True, "new_vehicle_receiver_zone_entry_accept", None)
 
         if self.within_wireless_margin(cam):
             self.add_track(cam)
-            return decision(True, "new_vehicle_margin_accept", None, None, None)
+            return decision(True, "new_vehicle_margin_accept", None)
 
         ego_match = self.find_ego_sensor_match(cam, ego_snapshots)
         if ego_match is not None:
             self.add_track(cam)
-            return decision(
-                True,
-                "new_vehicle_ego_accept",
-                ego_match["pos_error"],
-                ego_match["speed_error"],
-                ego_match["object_id"],
-            )
+            return decision(True, "new_vehicle_ego_accept", ego_match["object_id"], ego_match["gate"])
 
-        return decision(False, "new_vehicle_reject", None, None, None)
+        return decision(False, "new_vehicle_reject", None)
 
     def add_track(self, cam: dict):
-        track = KalmanTrack.from_cam(cam, self.initial_covariance)
+        track = self.track_class.from_cam(cam)
         self.tracks.append(track)
         self.tracks_by_station_id[track.station_id] = track
 
@@ -137,24 +140,17 @@ class CamOnlyKalmanDetector:
         if snapshot is None:
             return None
 
-        cam_pos = parse_position(cam["sender"]["pos"])
-        cam_speed = float(cam["sender"]["spd"])
         best_match = None
-        best_score = float("inf")
 
         for obj in snapshot.get("perceivedObjects", []):
-            if "global_pos" not in obj or "spd" not in obj:
+            measurement = perceived_object_as_cam(obj, int(cam["rcvTime"]))
+            if measurement is None:
                 continue
+            gate = self.measurement_gate(measurement, cam)
+            if best_match is None or self.gate_rank(gate) < self.gate_rank(best_match["gate"]):
+                best_match = {"object_id": obj.get("object_id"), "gate": gate}
 
-            obj_pos = parse_position(obj["global_pos"])
-            pos_error = float(np.linalg.norm(cam_pos[0:2] - obj_pos[0:2]))
-            speed_error = abs(cam_speed - float(obj["spd"]))
-            score = (pos_error / POSITION_THRESHOLD_M) + (speed_error / SPEED_THRESHOLD_MPS)
-            if score < best_score:
-                best_score = score
-                best_match = {"object_id": obj.get("object_id"), "pos_error": pos_error, "speed_error": speed_error}
-
-        if best_match and errors_within_threshold(best_match["pos_error"], best_match["speed_error"]):
+        if best_match and best_match["gate"].accepted:
             return best_match
         return None
 
@@ -162,18 +158,9 @@ class CamOnlyKalmanDetector:
 class CamCpmKalmanDetector(CamOnlyKalmanDetector):
     """Tsukada detector using one time-ordered CAM/CPM stream per receiver."""
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, kalman_type="nis"):
+        super().__init__(kalman_type)
         self.anonymous_track_counter = 0
-
-    def pre_source_decision(self, message: dict):
-        return None
-
-    def message_debug(self):
-        return {}
-
-    def on_perceived_object_match(self, cpm: dict, matched_track: KalmanTrack):
-        return {}
 
     def process_receiver(self, cam_path: Path | None, cpm_path: Path | None, ego_path: Path | None):
         # CAMs and CPMs received by this vehicle share one chronological track history.
@@ -184,10 +171,7 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
         rows = []
         for message in messages.to_dict(orient="records"):
             message_type = str(message["message_type"]).upper()
-            # Type 4 can reject before Kalman state is changed; type 3 returns None here.
-            source_decision = self.pre_source_decision(message)
-            if source_decision is None:
-                source_decision = self.process_cam(message, ego_snapshots)
+            source_decision = self.process_cam(message, ego_snapshots)
             object_counts = empty_object_counts()
             if message_type == "CPM":
                 perceived_objects = message.get("perceivedObjects", [])
@@ -215,7 +199,6 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
                 "prediction": 0 if source_decision["accepted"] else 1,
                 **source_decision,
                 **object_counts,
-                **self.message_debug(),
             })
 
         return pd.DataFrame(rows)
@@ -236,50 +219,52 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
                 counts["cpm_object_events"].append({"object_id": object_id, "action": "malformed"})
                 continue
 
-            best_track, pos_error, speed_error = self.closest_track(measurement)
+            best_track, gate = self.closest_track(measurement)
             # object_id is simulation ground truth; association uses only Kalman deviation.
-            if best_track is not None and errors_within_threshold(pos_error, speed_error):
+            if best_track is not None and gate.accepted:
                 # CPM object data is indirect: it may confirm a track, but must not update it.
                 counts["cpm_objects_matched"] += 1
-                event = {"object_id": object_id, "action": "matched"}
-                event.update(self.on_perceived_object_match(cpm, best_track))
-                counts["cpm_object_events"].append(event)
+                counts["cpm_object_events"].append({
+                    "object_id": object_id, "action": "matched", **gate_debug(gate)
+                })
                 continue
 
             if not perceived_object_within_sensor_range(perceived_object):
                 counts["cpm_objects_out_of_range"] += 1
-                counts["cpm_object_events"].append({"object_id": object_id, "action": "out_of_range"})
+                event = {"object_id": object_id, "action": "out_of_range"}
+                if gate is not None:
+                    event.update(gate_debug(gate))
+                counts["cpm_object_events"].append(event)
                 continue
 
             self.add_anonymous_object_track(measurement)
             counts["cpm_objects_initialized"] += 1
-            counts["cpm_object_events"].append({"object_id": object_id, "action": "initialized"})
+            event = {"object_id": object_id, "action": "initialized"}
+            if gate is not None:
+                event.update(gate_debug(gate))
+            counts["cpm_object_events"].append(event)
 
         return counts
 
     def closest_track(self, measurement: dict):
         best_track = None
-        best_pos_error = None
-        best_speed_error = None
-        best_score = float("inf")
+        best_gate = None
+        # NIS normalizes each residual by that track's predicted uncertainty.
         for track in self.tracks:
-            pos_error, speed_error = track.errors_against_cam(measurement)
-            score = (pos_error / POSITION_THRESHOLD_M) + (speed_error / SPEED_THRESHOLD_MPS)
-            if score < best_score:
+            gate = track.gate(measurement)
+            if best_gate is None or self.gate_rank(gate) < self.gate_rank(best_gate):
                 best_track = track
-                best_pos_error = pos_error
-                best_speed_error = speed_error
-                best_score = score
-        return best_track, best_pos_error, best_speed_error
+                best_gate = gate
+        return best_track, best_gate
 
     def add_anonymous_object_track(self, measurement: dict):
         self.anonymous_track_counter += 1
         # Do not expose the CPM ground-truth object_id as an observable station identity.
         measurement["sender_id"] = f"cpm_object_{self.anonymous_track_counter}"
-        track = KalmanTrack.from_cam(measurement, self.initial_covariance)
+        track = self.track_class.from_cam(measurement)
         self.tracks.append(track)
 
-def process_kalman_folder(input_folder: Path):
+def process_kalman_folder(input_folder: Path, kalman_type="nis"):
     cam_dir = input_folder / "cam"
     ego_dir = input_folder / "ego"
     if not cam_dir.is_dir():
@@ -288,7 +273,7 @@ def process_kalman_folder(input_folder: Path):
     receiver_results = []
     for cam_path in sorted(cam_dir.glob("*.json")):
         ego_path = ego_dir / cam_path.name if ego_dir.is_dir() else None
-        detector = CamOnlyKalmanDetector()
+        detector = CamOnlyKalmanDetector(kalman_type)
         receiver_results.append(detector.process_receiver(cam_path, ego_path))
 
     if not receiver_results:
@@ -299,10 +284,11 @@ def process_kalman_folder(input_folder: Path):
     metrics["wireless_range_m"] = WIRELESS_RANGE_M
     metrics["range_margin_m"] = RANGE_MARGIN_M
     metrics["total_messages"] = int(len(results))
+    metrics["kalman_type"] = kalman_type
     return metrics, results
 
 
-def process_cam_cpm_kalman_folder(input_folder: Path, detector_class=CamCpmKalmanDetector):
+def process_cam_cpm_kalman_folder(input_folder: Path, kalman_type="nis"):
     cam_dir = input_folder / "cam"
     cpm_dir = input_folder / "cpm"
     ego_dir = input_folder / "ego"
@@ -319,7 +305,7 @@ def process_cam_cpm_kalman_folder(input_folder: Path, detector_class=CamCpmKalma
     for receiver_id in receiver_ids:
         ego_path = ego_dir / f"{receiver_id}.json" if ego_dir.is_dir() else None
         # Kalman state is local to a receiver and must never leak between vehicles.
-        detector = detector_class()
+        detector = CamCpmKalmanDetector(kalman_type)
         receiver_results.append(detector.process_receiver(
             cam_paths.get(receiver_id), cpm_paths.get(receiver_id), ego_path
         ))
@@ -332,6 +318,7 @@ def process_cam_cpm_kalman_folder(input_folder: Path, detector_class=CamCpmKalma
     metrics["total_messages"] = int(len(results))
     metrics["cam_messages"] = int((results["message_type"] == "CAM").sum())
     metrics["cpm_messages"] = int((results["message_type"] == "CPM").sum())
+    metrics["kalman_type"] = kalman_type
     return metrics, results
 
 
@@ -424,10 +411,6 @@ def latest_ego_snapshot(ego_snapshots: list[dict], rcv_time: int):
     return latest
 
 
-def errors_within_threshold(pos_error, speed_error):
-    return pos_error <= POSITION_THRESHOLD_M and speed_error <= SPEED_THRESHOLD_MPS
-
-
 def sender_just_entered(cam: dict):
     return int(cam.get(
         "just_entered_communication_zone",
@@ -439,11 +422,37 @@ def receiver_just_entered(cam: dict):
     return int(cam.get("receiver", {}).get("just_entered_communication_zone", 0))
 
 
-def decision(accepted: bool, reason: str, pos_error, speed_error, matched_id):
+def gate_debug(gate):
     return {
+        "nis": gate.nis,
+        "nis_threshold": gate.nis_threshold,
+        "dt": gate.dt,
+        "innovation_x": float(gate.innovation[0]),
+        "innovation_y": float(gate.innovation[1]),
+        "innovation_vx": float(gate.innovation[2]),
+        "innovation_vy": float(gate.innovation[3]),
+        "pos_error": gate.position_error,
+        "speed_error": gate.speed_error,
+        "innovation_covariance_trace": gate.innovation_covariance_trace,
+        "innovation_covariance_condition": gate.innovation_covariance_condition,
+    }
+
+
+def decision(accepted: bool, reason: str, matched_id, gate=None):
+    result = {
         "accepted": accepted,
         "reason": reason,
-        "pos_error": pos_error,
-        "speed_error": speed_error,
         "matched_id": matched_id,
     }
+    if gate is None:
+        result.update({
+            "nis": None, "nis_threshold": None, "dt": None,
+            "innovation_x": None, "innovation_y": None,
+            "innovation_vx": None, "innovation_vy": None,
+            "pos_error": None, "speed_error": None,
+            "innovation_covariance_trace": None,
+            "innovation_covariance_condition": None,
+        })
+    else:
+        result.update(gate_debug(gate))
+    return result

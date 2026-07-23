@@ -29,6 +29,8 @@ public class ConfigSettings {
 
     public String jsonPath = "C:/simulation/mosaic/JSON/";
 
+    public String pseudonymDebugPath = "";
+
     public SimulationTime simulationTime = new SimulationTime();
 
     public SimulationArea simulationArea = new SimulationArea();
@@ -52,4 +54,3 @@ public class ConfigSettings {
         public double maxY = 11.498488;
     }
 }
-

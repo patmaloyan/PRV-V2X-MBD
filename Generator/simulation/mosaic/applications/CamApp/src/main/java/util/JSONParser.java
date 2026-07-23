@@ -44,4 +44,29 @@ public class JSONParser {
             e.printStackTrace();
         }
     }
+
+    public static synchronized void writePseudonymCount(
+            String outputFilePath, String vehicleId, long changeCount) {
+        File file = new File(outputFilePath);
+        JsonObject counts = new JsonObject();
+
+        try {
+            if (file.exists()) {
+                try (FileReader reader = new FileReader(file)) {
+                    JsonElement element = JsonParser.parseReader(reader);
+                    if (element.isJsonObject()) {
+                        counts = element.getAsJsonObject();
+                    }
+                }
+            }
+
+            counts.addProperty(vehicleId, changeCount);
+            try (FileWriter writer = new FileWriter(file)) {
+                gson.toJson(counts, writer);
+            }
+        } catch (IOException e) {
+            System.err.println("Error writing pseudonym debug file: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
 }

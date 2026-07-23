@@ -5,6 +5,9 @@ from filterpy.kalman import KalmanFilter
 import numpy as np
 
 
+# State and measurement vector: [x, y, vx, vy].
+
+
 def parse_position(pos_string: str) -> np.ndarray:
     parts = str(pos_string).split(",")
     return np.array([float(parts[0]), float(parts[1]), float(parts[2])], dtype=float)
@@ -26,6 +29,7 @@ class KalmanTrack:
 
     @classmethod
     def from_cam(cls, cam: dict, initial_covariance: np.ndarray):
+        # Step 1: Initialize a new track from the first CAM measurement.
         pos = parse_position(cam["sender"]["pos"])
         velocity = velocity_from_cam(cam)
         kf = KalmanFilter(dim_x=4, dim_z=4)
@@ -42,6 +46,7 @@ class KalmanTrack:
         return state
 
     def predict_to(self, time_ns: int):
+        # Step 2: Predict position and velocity at the new receive time.
         dt = max(0.0, (int(time_ns) - self.last_update_time) / 1_000_000_000.0)
         if dt == 0:
             return
@@ -57,6 +62,7 @@ class KalmanTrack:
         self.last_update_time = int(time_ns)
 
     def errors_against_cam(self, cam: dict):
+        # Step 3: Compare the prediction with the incoming CAM.
         predicted = self.predict_state(int(cam["rcvTime"]))
         pos = parse_position(cam["sender"]["pos"])
         velocity = velocity_from_cam(cam)
@@ -65,6 +71,7 @@ class KalmanTrack:
         return pos_error, speed_error
 
     def update_from_cam(self, cam: dict, measurement_noise: np.ndarray):
+        # Step 4: Correct the predicted track with the accepted CAM measurement.
         self.predict_to(int(cam["rcvTime"]))
         pos = parse_position(cam["sender"]["pos"])
         velocity = velocity_from_cam(cam)

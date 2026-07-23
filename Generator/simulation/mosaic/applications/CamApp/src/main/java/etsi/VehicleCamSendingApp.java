@@ -48,7 +48,6 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Objects;
@@ -64,22 +63,15 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
     private static final double VIEWING_RANGE = 80d;
     // Send CPMs once per second, using MOSAIC simulation time in nanoseconds.
     private static final long CPM_INTERVAL = 1_000_000_000L;
+    private static final long PSEUDONYM_INTERVAL = 100_000_000_000L;
 
     JSONParser jsonParser = new JSONParser();
     SerializationUtils serializationUtils = new SerializationUtils();
     SensorErrorModel sensorErrorModel = new SensorErrorModel();
 
     private Data data = new Data();
-    private double distanceDrivenSinceLastChange = 0;
-    private boolean firstChange = true;
-    private boolean randomDistanceSet = false;
-    private double randomDistance = 800;
-    private boolean randomTimeSet = false;
-    private double randomTime;
     private CartesianPoint lastPosition;
-    private LocalDateTime initialTime = LocalDateTime.now();
-    // ADDITION: previous Eclipse logic used real time; pseudonym changes now use simulation time.
-    private long initialSimulationTime = 0L;
+    private long pseudonymChangeCount = 0L;
     private DriverProfile driverProfile;
 
     private Pair<MutableCartesianPoint, MutableCartesianPoint> postProcessingPoint;
@@ -104,7 +96,8 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
         // Give each vehicle a fixed random CPM phase so transmissions do not all occur on .000.
         cpmInitialOffset = 1L + (long) (Math.random() * CPM_INTERVAL);
         scheduleInitialCpmEvent();
-        initialSimulationTime = getOperatingSystem().getSimulationTime();
+        scheduleNextPseudonymChange();
+        writePseudonymDebug();
         
         if (getConfiguration().enableDriverProfiles) {
             Random rand = new Random();
@@ -137,6 +130,31 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
         getOperatingSystem().getEventManager().addEvent(
                 getOperatingSystem().getSimulationTime() + CPM_INTERVAL, this::generateCpm
         );
+    }
+
+    private void scheduleNextPseudonymChange() {
+        getOperatingSystem().getEventManager().addEvent(
+                getOperatingSystem().getSimulationTime() + PSEUDONYM_INTERVAL,
+                this::changePseudonym
+        );
+    }
+
+    private void changePseudonym(Event event) {
+        if (!canProcessEvent()) {
+            return;
+        }
+
+        long previousAlias = data.alias;
+        do {
+            data.alias = (long) ((Math.random() * 9_000_000_000L) + 1_000_000_000L);
+        } while (data.alias == previousAlias);
+
+        if (isInSimulationArea()) {
+            pseudonymChangeCount++;
+            writePseudonymDebug();
+        }
+        getLog().debugSimTime(this, "Changed pseudonym {} -> {}", previousAlias, data.alias);
+        scheduleNextPseudonymChange();
     }
 
     // Run one CPM send tick and reschedule the following tick.
@@ -358,31 +376,25 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
 
     @Override
     public void onMessageTransmitted(V2xMessageTransmission v2xMessageTransmission) {
-//        distanceDrivenSinceLastChange += this.data.projectedPosition.distanceTo(lastPosition);
-//        if (firstChange) {
-//            if (!randomDistanceSet) {
-//                randomDistance =  800 + (1500 - 800) * Math.random();
-//                randomDistanceSet = true;
-//            }
-//            if (distanceDrivenSinceLastChange > randomDistance) {
-//                data.alias = (long) ((Math.random() * 9_000_000_000L) + 1_000_000_000L);
-//                distanceDrivenSinceLastChange = 0;
-//                firstChange = false;
-//            }
-//        }
+        // Pseudonym changes are driven by scheduled simulation-time events.
+    }
 
-        if (!randomTimeSet) {
-            // Previous randomized interval: 100 s to 200 s.
-            // randomTime = 100_000_000_000L + (200_000_000_000L - 100_000_000_000L) * Math.random();
-            randomTime = 100_000_000_000L;
-            randomTimeSet = true;
-        }
+    @Override
+    public void onShutdown() {
+        writePseudonymDebug();
+        super.onShutdown();
+    }
 
-        if (getOperatingSystem().getSimulationTime() - initialSimulationTime > randomTime) {
-            data.alias = (long) ((Math.random() * 9_000_000_000L) + 1_000_000_000L);
-            initialSimulationTime = getOperatingSystem().getSimulationTime();
-            randomTimeSet = false;
-        }
+    private void writePseudonymDebug() {
+        String configuredPath = getConfiguration().pseudonymDebugPath;
+        String outputPath = configuredPath == null || configuredPath.isBlank()
+                ? new File(getConfiguration().jsonPath, "pseudonym_debug.json").getPath()
+                : configuredPath;
+        JSONParser.writePseudonymCount(
+                outputPath,
+                getOs().getId(),
+                pseudonymChangeCount
+        );
     }
 
     private void getPostProcessingValue(VehicleData vehicleData) {

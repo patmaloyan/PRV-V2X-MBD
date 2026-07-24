@@ -31,6 +31,9 @@ public class ConfigSettings {
 
     public String pseudonymDebugPath = "";
 
+    @JsonAdapter(TimeFieldAdapter.NanoSeconds.class)
+    public long pseudonymInterval = 100_000_000_000L;
+
     public SimulationTime simulationTime = new SimulationTime();
 
     public SimulationArea simulationArea = new SimulationArea();

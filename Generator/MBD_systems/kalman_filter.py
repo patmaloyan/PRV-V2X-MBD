@@ -6,6 +6,14 @@ import numpy as np
 
 
 # State and measurement vector: [x, y, vx, vy].
+# Fixed approximation of SensorErrorModel.java:
+# position is uniform ±5 m; velocity variance includes its heading error.
+SENSOR_MEASUREMENT_COVARIANCE = np.diag([
+    25.0 / 3.0,
+    25.0 / 3.0,
+    0.25,
+    0.25,
+])
 
 
 def parse_position(pos_string: str) -> np.ndarray:
@@ -26,6 +34,7 @@ class KalmanTrack:
     station_alias: int
     filter: KalmanFilter
     last_update_time: int
+    last_seen_time: int
 
     @classmethod
     def from_cam(cls, cam: dict, initial_covariance: np.ndarray):
@@ -36,7 +45,8 @@ class KalmanTrack:
         kf.x = np.array([pos[0], pos[1], velocity[0], velocity[1]], dtype=float)
         kf.P = initial_covariance.copy()  # Starting uncertainty for a new vehicle track.
         kf.H = np.eye(4)
-        return cls(str(cam["sender_id"]), int(cam.get("sender_alias", 0)), kf, int(cam["rcvTime"]))
+        time_ns = int(cam["rcvTime"])
+        return cls(str(cam["sender_id"]), int(cam.get("sender_alias", 0)), kf, time_ns, time_ns)
 
     def predict_state(self, time_ns: int):
         state = self.filter.x.copy()
@@ -73,6 +83,7 @@ class KalmanTrack:
     def update_from_cam(self, cam: dict, measurement_noise: np.ndarray):
         # Step 4: Correct the predicted track with the accepted CAM measurement.
         self.predict_to(int(cam["rcvTime"]))
+        self.last_seen_time = int(cam["rcvTime"])
         pos = parse_position(cam["sender"]["pos"])
         velocity = velocity_from_cam(cam)
         measurement = np.array([pos[0], pos[1], velocity[0], velocity[1]], dtype=float)

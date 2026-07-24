@@ -4,13 +4,14 @@ from pathlib import Path
 
 from kalman_detector import (
     CamCpmKalmanDetector,
+    cpm_object_errors_within_threshold,
     decision,
     process_cam_cpm_kalman_folder,
 )
 
 
-EDGE_GRACE_NS = 2_000_000_000
-EDGE_TTL_NS = 4_000_000_000
+EDGE_GRACE_NS = 3_000_000_000
+EDGE_TTL_NS = 6_000_000_000
 
 
 def valid_alias(value):
@@ -22,10 +23,19 @@ def valid_alias(value):
 
 
 class CpmEnhancedDetector(CamCpmKalmanDetector):
-    def __init__(self):
+    def __init__(self, required_unreciprocated_edges=1):
         super().__init__()
+        self.required_unreciprocated_edges = required_unreciprocated_edges
         self.edges = {}
         self.last_unreciprocated_targets = []
+
+    def perceived_object_matches(self, measurement):
+        matches = []
+        for track in self.tracks:
+            pos_error, speed_error = track.errors_against_cam(measurement)
+            if cpm_object_errors_within_threshold(pos_error, speed_error):
+                matches.append(track)
+        return matches
 
     def prune_edges(self, now):
         # Keep only observations from the last four seconds.
@@ -56,7 +66,7 @@ class CpmEnhancedDetector(CamCpmKalmanDetector):
             return []
         return sorted(
             target for target, timestamps in self.edges.get(source, {}).items()
-            # Allow two seconds for the reverse observation to arrive.
+            # Allow grace seconds for the reverse observation to arrive.
             if now - timestamps[0] >= EDGE_GRACE_NS
             and source not in self.edges.get(target, {})
         )
@@ -67,12 +77,15 @@ class CpmEnhancedDetector(CamCpmKalmanDetector):
         self.last_unreciprocated_targets = self.unreciprocated_targets(
             message.get("sender_alias"), now
         )
-        if self.last_unreciprocated_targets:
+        if len(self.last_unreciprocated_targets) >= self.required_unreciprocated_edges:
             # Reject before the normal flow so this message cannot update Kalman state.
             return decision(False, "reciprocity_reject", None, None, None)
         return None
 
     def on_perceived_object_match(self, cpm, matched_track):
+        if self.tracks_by_station_id.get(str(matched_track.station_id)) is not matched_track:
+            return {"edge_added": False}
+
         # Graph identities are observable aliases, never simulation-only object_id values.
         edge_added = self.add_edge(
             cpm.get("sender_alias"), matched_track.station_alias, cpm["rcvTime"]
@@ -86,8 +99,12 @@ class CpmEnhancedDetector(CamCpmKalmanDetector):
         return {
             "edge_count": self.edge_count(),
             "unreciprocated_targets": self.last_unreciprocated_targets,
+            "required_unreciprocated_edges": self.required_unreciprocated_edges,
         }
 
 
-def process_cpm_enhanced_folder(input_folder: Path):
-    return process_cam_cpm_kalman_folder(input_folder, CpmEnhancedDetector)
+def process_cpm_enhanced_folder(input_folder: Path, required_unreciprocated_edges=1):
+    return process_cam_cpm_kalman_folder(
+        input_folder,
+        lambda: CpmEnhancedDetector(required_unreciprocated_edges),
+    )

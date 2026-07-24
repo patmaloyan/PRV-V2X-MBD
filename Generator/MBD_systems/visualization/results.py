@@ -19,6 +19,7 @@ DETECTORS = {
     2: ("CAM Only", "kalman_cam_only"),
     3: ("CAM+CPM", "kalman_cam_cpm"),
     4: ("CAM+CPM + Reciprocity", "kalman_cam_cpm_enhanced"),
+    5: ("CAM+CPM + 2-Edge Reciprocity", "kalman_cam_cpm_enhanced_two_edges"),
 }
 
 ATTACK_LABELS = {
@@ -29,8 +30,12 @@ ATTACK_LABELS = {
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run and plot Kalman detector comparisons.")
+    parser.add_argument(
+        "filename",
+        help="Output filename suffix; the setting is added as a prefix",
+    )
     parser.add_argument("--setting", default="urban", help="Simulation setting, such as urban or highway")
-    parser.add_argument("--types", nargs="+", type=int, default=[2, 3, 4], help="Detector types (2, 3, 4)")
+    parser.add_argument("--types", nargs="+", type=int, default=[2, 3, 4, 5], help="Detector types (2, 3, 4, 5)")
     parser.add_argument(
         "--attacks",
         nargs="+",
@@ -48,7 +53,7 @@ def parse_args():
 def validate_args(args):
     unsupported = [detector_type for detector_type in args.types if detector_type not in DETECTORS]
     if unsupported:
-        raise ValueError(f"Unsupported detector types: {unsupported}; choose from 2, 3, 4")
+        raise ValueError(f"Unsupported detector types: {unsupported}; choose from 2, 3, 4, 5")
     if len(set(args.types)) != len(args.types):
         raise ValueError("Detector types must not contain duplicates")
     if len(set(args.attacks)) != len(args.attacks):
@@ -212,7 +217,7 @@ def main():
         output_path = (
             Path(__file__).resolve().parent
             / "created"
-            / f"detection_comparison_{args.setting}.png"
+            / f"{args.setting}_{args.filename}"
         )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         plot_results(args, results, output_path)

@@ -1,26 +1,31 @@
+"""Implements detection logic for known IDs, pseudonym changes, and new vehicles."""
+
 import json
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from kalman_filter import KalmanTrack, parse_position
+from kalman_filter import KalmanTrack, SENSOR_MEASUREMENT_COVARIANCE, parse_position
 
 
 POSITION_THRESHOLD_M = 10
 SPEED_THRESHOLD_MPS = 5
+CPM_OBJECT_POSITION_THRESHOLD_M = 10
+CPM_OBJECT_SPEED_THRESHOLD_MPS = 5
 WIRELESS_RANGE_M = 300.0
 RANGE_MARGIN_M = 50.0
 EGO_LOOKBACK_NS = 2_000_000_000
 CPM_SENSOR_RANGE_M = 80.0
+TRACK_EXPIRY_NS = 10_000_000_000
 
 
 class CamOnlyKalmanDetector:
     def __init__(self):
         self.tracks = []
         self.tracks_by_station_id = {}
-        self.initial_covariance = np.diag([25.0, 25.0, 9.0, 9.0])  # Initial x/y/vx/vy uncertainty.
-        self.measurement_noise = np.diag([9.0, 9.0, 4.0, 4.0])  # CAM x/y/vx/vy measurement noise.
+        self.initial_covariance = SENSOR_MEASUREMENT_COVARIANCE.copy()
+        self.measurement_noise = SENSOR_MEASUREMENT_COVARIANCE.copy()
 
     def process_receiver(self, cam_path: Path, ego_path: Path | None):
         cam_messages = sorted(load_json_list(cam_path), key=lambda msg: int(msg["rcvTime"]))
@@ -46,6 +51,8 @@ class CamOnlyKalmanDetector:
         return pd.DataFrame(rows)
 
     def process_cam(self, cam: dict, ego_snapshots: list[dict]):
+        self.prepare_tracks_for_message(cam)
+
         # Flowchart order: known ID, pseudonym change, then new vehicle.
         known_result = self.known_station_id_check(cam)
         if known_result is not None:
@@ -56,6 +63,20 @@ class CamOnlyKalmanDetector:
             return pseudonym_result
 
         return self.new_vehicle_check(cam, ego_snapshots)
+
+    def prepare_tracks_for_message(self, message):
+        current_time = int(message["rcvTime"])
+        active_tracks = []
+        for track in self.tracks:
+            if current_time - track.last_seen_time <= TRACK_EXPIRY_NS:
+                active_tracks.append(track)
+            elif self.tracks_by_station_id.get(track.station_id) is track:
+                self.tracks_by_station_id.pop(track.station_id)
+        self.tracks = active_tracks
+
+        known_track = self.tracks_by_station_id.get(str(message["sender_id"]))
+        if known_track is not None:
+            known_track.last_seen_time = current_time
 
     def known_station_id_check(self, cam: dict):
         track = self.tracks_by_station_id.get(str(cam["sender_id"]))
@@ -77,6 +98,7 @@ class CamOnlyKalmanDetector:
 
         for track in self.tracks:
             pos_error, speed_error = track.errors_against_cam(cam)
+            # Compute score based on normalized errrors.
             score = (pos_error / POSITION_THRESHOLD_M) + (speed_error / SPEED_THRESHOLD_MPS)
             if score < best_score:
                 best_track = track
@@ -111,13 +133,8 @@ class CamOnlyKalmanDetector:
         ego_match = self.find_ego_sensor_match(cam, ego_snapshots)
         if ego_match is not None:
             self.add_track(cam)
-            return decision(
-                True,
-                "new_vehicle_ego_accept",
-                ego_match["pos_error"],
-                ego_match["speed_error"],
-                ego_match["object_id"],
-            )
+            return decision( True, "new_vehicle_ego_accept", ego_match["pos_error"],
+                ego_match["speed_error"], ego_match["object_id"])
 
         return decision(False, "new_vehicle_reject", None, None, None)
 
@@ -175,6 +192,12 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
     def on_perceived_object_match(self, cpm: dict, matched_track: KalmanTrack):
         return {}
 
+    def perceived_object_matches(self, measurement):
+        best_track, pos_error, speed_error = self.closest_track(measurement)
+        if best_track is not None and cpm_object_errors_within_threshold(pos_error, speed_error):
+            return [best_track]
+        return []
+
     def process_receiver(self, cam_path: Path | None, cpm_path: Path | None, ego_path: Path | None):
         # CAMs and CPMs received by this vehicle share one chronological track history.
         messages = combined_message_frame(cam_path, cpm_path)
@@ -184,6 +207,7 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
         rows = []
         for message in messages.to_dict(orient="records"):
             message_type = str(message["message_type"]).upper()
+            self.prepare_tracks_for_message(message)
             # Type 4 can reject before Kalman state is changed; type 3 returns None here.
             source_decision = self.pre_source_decision(message)
             if source_decision is None:
@@ -230,25 +254,35 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
         counts["cpm_objects_observed"] = len(objects)
         for perceived_object in objects:
             object_id = perceived_object.get("object_id") if isinstance(perceived_object, dict) else None
+            if not perceived_object_within_sensor_range(perceived_object):
+                counts["cpm_objects_out_of_range"] += 1
+                counts["cpm_object_events"].append({"object_id": object_id, "action": "out_of_range"})
+                continue
+
             measurement = perceived_object_as_cam(perceived_object, int(cpm["rcvTime"]))
             if measurement is None:
                 counts["cpm_objects_malformed"] += 1
                 counts["cpm_object_events"].append({"object_id": object_id, "action": "malformed"})
                 continue
 
-            best_track, pos_error, speed_error = self.closest_track(measurement)
+            matched_tracks = self.perceived_object_matches(measurement)
             # object_id is simulation ground truth; association uses only Kalman deviation.
-            if best_track is not None and errors_within_threshold(pos_error, speed_error):
+            if matched_tracks:
                 # CPM object data is indirect: it may confirm a track, but must not update it.
+                edge_results = []
+                for matched_track in matched_tracks:
+                    matched_track.last_seen_time = int(cpm["rcvTime"])
+                    edge_results.append(self.on_perceived_object_match(cpm, matched_track))
                 counts["cpm_objects_matched"] += 1
                 event = {"object_id": object_id, "action": "matched"}
-                event.update(self.on_perceived_object_match(cpm, best_track))
+                if len(edge_results) == 1:
+                    event.update(edge_results[0])
+                else:
+                    event["edge_added"] = any(result.get("edge_added", False) for result in edge_results)
+                    event["edges_added"] = sum(
+                        result.get("edge_added", False) for result in edge_results
+                    )
                 counts["cpm_object_events"].append(event)
-                continue
-
-            if not perceived_object_within_sensor_range(perceived_object):
-                counts["cpm_objects_out_of_range"] += 1
-                counts["cpm_object_events"].append({"object_id": object_id, "action": "out_of_range"})
                 continue
 
             self.add_anonymous_object_track(measurement)
@@ -264,7 +298,10 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
         best_score = float("inf")
         for track in self.tracks:
             pos_error, speed_error = track.errors_against_cam(measurement)
-            score = (pos_error / POSITION_THRESHOLD_M) + (speed_error / SPEED_THRESHOLD_MPS)
+            score = ( # use original thresholds for any score
+                pos_error / POSITION_THRESHOLD_M
+                + speed_error / SPEED_THRESHOLD_MPS
+            )
             if score < best_score:
                 best_track = track
                 best_pos_error = pos_error
@@ -282,8 +319,6 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
 def process_kalman_folder(input_folder: Path):
     cam_dir = input_folder / "cam"
     ego_dir = input_folder / "ego"
-    if not cam_dir.is_dir():
-        raise ValueError(f"Kalman detector expects CAM folder at {cam_dir}")
 
     receiver_results = []
     for cam_path in sorted(cam_dir.glob("*.json")):
@@ -426,6 +461,13 @@ def latest_ego_snapshot(ego_snapshots: list[dict], rcv_time: int):
 
 def errors_within_threshold(pos_error, speed_error):
     return pos_error <= POSITION_THRESHOLD_M and speed_error <= SPEED_THRESHOLD_MPS
+
+
+def cpm_object_errors_within_threshold(pos_error, speed_error):
+    return (
+        pos_error <= CPM_OBJECT_POSITION_THRESHOLD_M
+        and speed_error <= CPM_OBJECT_SPEED_THRESHOLD_MPS
+    )
 
 
 def sender_just_entered(cam: dict):

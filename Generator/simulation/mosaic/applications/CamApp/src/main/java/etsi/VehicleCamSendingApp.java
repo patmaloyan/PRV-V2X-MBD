@@ -63,7 +63,6 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
     private static final double VIEWING_RANGE = 80d;
     // Send CPMs once per second, using MOSAIC simulation time in nanoseconds.
     private static final long CPM_INTERVAL = 1_000_000_000L;
-    private static final long PSEUDONYM_INTERVAL = 100_000_000_000L;
 
     JSONParser jsonParser = new JSONParser();
     SerializationUtils serializationUtils = new SerializationUtils();
@@ -81,6 +80,7 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
     private long cpmMessageCounter = 0;
     private long cpmInitialOffset;
     private boolean wasInCommunicationZone = false;
+    private boolean pseudonymDebugRegistered = false;
     private long communicationZoneEntryTime = -1L;
 
     @Override
@@ -97,7 +97,6 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
         cpmInitialOffset = 1L + (long) (Math.random() * CPM_INTERVAL);
         scheduleInitialCpmEvent();
         scheduleNextPseudonymChange();
-        writePseudonymDebug();
         
         if (getConfiguration().enableDriverProfiles) {
             Random rand = new Random();
@@ -134,7 +133,7 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
 
     private void scheduleNextPseudonymChange() {
         getOperatingSystem().getEventManager().addEvent(
-                getOperatingSystem().getSimulationTime() + PSEUDONYM_INTERVAL,
+                getOperatingSystem().getSimulationTime() + getConfiguration().pseudonymInterval,
                 this::changePseudonym
         );
     }
@@ -150,6 +149,7 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
         } while (data.alias == previousAlias);
 
         if (isInSimulationArea()) {
+            registerPseudonymDebug();
             pseudonymChangeCount++;
             writePseudonymDebug();
         }
@@ -381,8 +381,17 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
 
     @Override
     public void onShutdown() {
-        writePseudonymDebug();
+        if (pseudonymDebugRegistered) {
+            writePseudonymDebug();
+        }
         super.onShutdown();
+    }
+
+    private void registerPseudonymDebug() {
+        if (!pseudonymDebugRegistered) {
+            pseudonymDebugRegistered = true;
+            writePseudonymDebug();
+        }
     }
 
     private void writePseudonymDebug() {
@@ -517,6 +526,7 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
         if (!wasInCommunicationZone) {
             wasInCommunicationZone = true;
             communicationZoneEntryTime = now;
+            registerPseudonymDebug();
         }
 
         return now - communicationZoneEntryTime <= 2_000_000_000L ? 1 : 0;

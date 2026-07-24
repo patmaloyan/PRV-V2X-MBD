@@ -1,11 +1,10 @@
+import argparse
 import json
 import traci
 import sys
 import math
-import pandas as pd
-import numpy as np
 import os
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -101,40 +100,6 @@ def parse_position(pos_string) -> Tuple[float, float, float]:
     return float(parts[0]), float(parts[1]), float(parts[2])
 
 
-def reconstruct_nested(row):
-    return {
-        'rcvTime': row['rcvTime'],
-        'sendTime': row['sendTime'],
-        'sender_id': row['sender_id'],
-        'sender_alias': row['sender_alias'],
-        'messageID': row['messageID'],
-        'attacker': row['attacker'],
-        'receiver': {
-            'pos': row['receiver_pos'],
-            'pos_noise': row['receiver_pos_noise'],
-            'spd': row['receiver_spd'],
-            'spd_noise': row['receiver_spd_noise'],
-            'acl': row['receiver_acl'],
-            'acl_noise': row['receiver_acl_noise'],
-            'hed': row['receiver_hed'],
-            'hed_noise': row['receiver_hed_noise'],
-            'driversProfile': row['receiver_driversProfile']
-        },
-        'sender': {
-            'pos': row['sender_pos'],
-            'pos_noise': row['sender_pos_noise'],
-            'spd': row['sender_spd'],
-            'spd_noise': row['sender_spd_noise'],
-            'acl': row['sender_acl'],
-            'acl_noise': row['sender_acl_noise'],
-            'hed': row['sender_hed'],
-            'hed_noise': row['sender_hed_noise'],
-            'driversProfile': row['sender_driversProfile'],
-            'distance_to_road_edge': row['distance_to_nearest_road_edge'],
-        }
-    }
-
-
 def worker_process_batch(json_files: List[str], sumo_config: str, worker_id: int):
     """Worker processes multiple JSON files with a single SUMO instance."""
     results = []
@@ -145,6 +110,7 @@ def worker_process_batch(json_files: List[str], sumo_config: str, worker_id: int
         sumo_binary = "sumo"
         traci.start([sumo_binary, "-c", sumo_config, "--no-step-log", "true"],
                     port=port, label=str(port))
+        traci.switch(str(port))
 
         # Process all assigned files
         for json_file in json_files:
@@ -152,20 +118,15 @@ def worker_process_batch(json_files: List[str], sumo_config: str, worker_id: int
                 with open(json_file, 'r') as f:
                     messages = json.load(f)
 
-                df = pd.json_normalize(messages, sep='_')
-                df['distance_to_nearest_road_edge'] = np.nan
-
-                for i, row in df.iterrows():
-                    pos_string = row.get('sender_pos', '')
+                for message in messages:
+                    sender = message.get('sender', {})
+                    pos_string = sender.get('pos', '')
                     if pos_string:
                         x, y, z = parse_position(pos_string)
-                        distanz = get_distance_to_nearest_road(x, y)
-                        df.at[i, 'distance_to_nearest_road_edge'] = distanz
-
-                messages_with_distance = df.apply(reconstruct_nested, axis=1).tolist()
+                        sender['distance_to_road_edge'] = get_distance_to_nearest_road(x, y)
 
                 with open(json_file, 'w', encoding='utf-8') as f:
-                    json.dump(messages_with_distance, f, indent=2)
+                    json.dump(messages, f, indent=2)
 
                 results.append({'status': 'ok', 'file': json_file})
 
@@ -178,27 +139,112 @@ def worker_process_batch(json_files: List[str], sumo_config: str, worker_id: int
     return results
 
 
+def discover_message_files(input_folder: Path) -> list[Path]:
+    if input_folder.name in {"cam", "cpm"}:
+        return sorted(input_folder.glob("*.json"))
+
+    nested_files = sorted(
+        path for path in input_folder.rglob("*.json")
+        if path.parent.name in {"cam", "cpm"}
+    )
+    if nested_files:
+        return nested_files
+    return sorted(input_folder.glob("*.json"))
+
+
+def infer_sumo_config(input_folder: Path) -> Path:
+    search_roots = [input_folder, *input_folder.parents]
+    config_descriptors = []
+    for root in search_roots:
+        scenarios_dir = root / "scenarios"
+        if scenarios_dir.is_dir():
+            config_descriptors.extend(scenarios_dir.glob("*/sumo/sumo_config.json"))
+            break
+
+    resolved = []
+    for descriptor in config_descriptors:
+        with descriptor.open("r", encoding="utf-8") as file:
+            config_name = json.load(file).get("sumoConfigurationFile")
+        if config_name:
+            candidate = descriptor.parent / config_name
+            if candidate.is_file():
+                resolved.append(candidate)
+
+    if len(resolved) == 1:
+        return resolved[0]
+    if not resolved:
+        raise ValueError(
+            "Could not infer the SUMO configuration. Pass it explicitly as the "
+            "second positional argument."
+        )
+    raise ValueError(
+        "Multiple SUMO configurations were found. Pass the intended .sumocfg "
+        "file explicitly as the second positional argument."
+    )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Add sender road-edge distance to CAM and CPM JSON messages."
+    )
+    parser.add_argument(
+        "input_folder",
+        type=Path,
+        help="A flat message folder, a json_* folder, or an urban/highway test root",
+    )
+    parser.add_argument(
+        "sumo_config",
+        nargs="?",
+        type=Path,
+        help="SUMO .sumocfg file; inferred from the test structure when omitted",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=os.cpu_count() or 4,
+        help="Number of parallel SUMO workers",
+    )
+    return parser.parse_args()
+
+
 def main():
-    if len(sys.argv) < 3:
-        print("Usage: py enrichMsgs_multithreading <messages_folder> <sumo_config.sumocfg> [--workers N]")
-        sys.exit(1)
+    args = parse_args()
+    input_folder = args.input_folder.resolve()
+    if not input_folder.is_dir():
+        print(f"Error: input folder does not exist: {input_folder}", file=sys.stderr)
+        return 1
 
-    input_folder = Path(sys.argv[1])
-    sumo_config = sys.argv[2]
+    try:
+        sumo_config = (
+            args.sumo_config.resolve()
+            if args.sumo_config is not None
+            else infer_sumo_config(input_folder)
+        )
+    except ValueError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+    if not sumo_config.is_file():
+        print(f"Error: SUMO configuration does not exist: {sumo_config}", file=sys.stderr)
+        return 1
 
-    # Optional number of workers
-    max_workers = os.cpu_count() or 4
-    if len(sys.argv) > 4 and sys.argv[3] == '--workers':
-        max_workers = int(sys.argv[4])
-
-    # Collect all JSON files
-    json_files = list(input_folder.glob('*.json'))
+    json_files = discover_message_files(input_folder)
     total_files = len(json_files)
 
     if total_files == 0:
-        print("No JSON files found!")
-        sys.exit(1)
+        print(
+            f"Error: no CAM or CPM JSON files found under {input_folder}",
+            file=sys.stderr,
+        )
+        return 1
 
+    max_workers = max(1, args.workers)
+    cam_count = sum(path.parent.name == "cam" for path in json_files)
+    cpm_count = sum(path.parent.name == "cpm" for path in json_files)
+    print(
+        f"Found {total_files} message files ({cam_count} CAM, {cpm_count} CPM).",
+        file=sys.stderr,
+    )
+    print(f"Using SUMO configuration: {sumo_config}", file=sys.stderr)
     print(f"Starting processing with {max_workers} workers...", file=sys.stderr)
     count = 0
     errors = []
@@ -213,7 +259,7 @@ def main():
         for worker_id, chunk in enumerate(chunks):
             f = executor.submit(worker_process_batch,
                                 [str(f) for f in chunk],
-                                sumo_config,
+                                str(sumo_config),
                                 worker_id)
             futures.append(f)
 
@@ -229,15 +275,18 @@ def main():
                         errors.append((Path(result['file']).name, result.get('error')))
             except Exception as e:
                 print(f"[ERROR] Worker failed: {e}", file=sys.stderr)
+                errors.append(("<worker>", str(e)))
 
     # Summary
     if errors:
         print(f"\n{len(errors)} files with errors:", file=sys.stderr)
         for file, error in errors:
             print(f"  - {file}: {error}", file=sys.stderr)
+        return 1
     else:
         print(f"\nAll {total_files} files processed successfully!")
+        return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

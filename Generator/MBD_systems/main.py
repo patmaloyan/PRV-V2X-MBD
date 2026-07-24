@@ -82,7 +82,7 @@ def main():
     parser.add_argument("--input_folder", help="Pfad zu den Eingabedateien", required=True)
     parser.add_argument(
         "--type",
-        help="0 = catch-checks, 1 = legacy checks, 2 = CAM-only Kalman, 3 = CAM+CPM Kalman, 4 = reciprocal CPM Kalman",
+        help="0 = catch-checks, 1 = legacy checks, 2 = CAM-only Kalman, 3 = CAM+CPM Kalman, 4 = reciprocal CPM Kalman, 5 = two-edge reciprocal CPM Kalman",
         required=True,
     )
     parser.add_argument("--train", type=float)
@@ -199,7 +199,9 @@ def main():
         return
 
     if int(args.type) == 4:
-        metrics, debug_results = process_cpm_enhanced_folder(input_folder)
+        metrics, debug_results = process_cpm_enhanced_folder(
+            input_folder, required_unreciprocated_edges=1
+        )
         scenario_stats.append(metrics)
         aggregated_metrics = evaluate_predictions(scenario_stats)
         for key in [
@@ -211,6 +213,31 @@ def main():
 
         if args.train == 0:
             output_dir = result_directory(input_folder, "kalman_cam_cpm_enhanced")
+            output_file = output_dir / "predicted.json"
+            debug_file = output_dir / "debug.json"
+            print(f"Saved in {output_file}")
+            with open(output_file, 'w') as f:
+                json.dump(aggregated_metrics, f, indent=4)
+            with open(debug_file, 'w') as f:
+                json.dump(debug_results.where(pd.notnull(debug_results), None).to_dict(orient='records'), f, indent=4)
+            print(f"Saved debug in {debug_file}")
+        return
+
+    if int(args.type) == 5:
+        metrics, debug_results = process_cpm_enhanced_folder(
+            input_folder, required_unreciprocated_edges=2
+        )
+        scenario_stats.append(metrics)
+        aggregated_metrics = evaluate_predictions(scenario_stats)
+        for key in [
+            "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
+            "total_messages", "cam_messages", "cpm_messages",
+        ]:
+            aggregated_metrics[key] = metrics.get(key)
+        print(aggregated_metrics['f1'])
+
+        if args.train == 0:
+            output_dir = result_directory(input_folder, "kalman_cam_cpm_enhanced_two_edges")
             output_file = output_dir / "predicted.json"
             debug_file = output_dir / "debug.json"
             print(f"Saved in {output_file}")

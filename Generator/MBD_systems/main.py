@@ -153,6 +153,7 @@ def main():
     count = 0
     max_workers = args.workers
 
+    # *** Added Section for Kalman procedure, each type of evalutation ***
     if int(args.type) == 2:
         metrics, debug_results = process_kalman_folder(input_folder)
         scenario_stats.append(metrics)

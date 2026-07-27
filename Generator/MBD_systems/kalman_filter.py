@@ -77,7 +77,7 @@ class KalmanTrack:
         pos = parse_position(cam["sender"]["pos"])
         velocity = velocity_from_cam(cam)
         pos_error = float(np.linalg.norm(predicted[0:2] - pos[0:2]))
-        speed_error = float(abs(np.linalg.norm(predicted[2:4]) - np.linalg.norm(velocity)))
+        speed_error = float(np.linalg.norm(predicted[2:4] - velocity))
         return pos_error, speed_error
 
     def update_from_cam(self, cam: dict, measurement_noise: np.ndarray):

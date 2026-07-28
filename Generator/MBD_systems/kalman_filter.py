@@ -28,31 +28,52 @@ def velocity_from_cam(cam: dict) -> np.ndarray:
     return np.array([speed * math.sin(heading_rad), speed * math.cos(heading_rad)], dtype=float)
 
 
+def acceleration_from_cam(cam: dict) -> np.ndarray:
+    sender = cam["sender"]
+    acceleration = float(sender.get("acl", 0.0) or 0.0)
+    heading_rad = math.radians(float(sender["hed"]))
+    return np.array([
+        acceleration * math.sin(heading_rad),
+        acceleration * math.cos(heading_rad),
+    ], dtype=float)
+
+
 @dataclass
 class KalmanTrack:
     station_id: str
     station_alias: int
     filter: KalmanFilter
+    last_acceleration: np.ndarray
     last_update_time: int
-    last_seen_time: int
+    last_accepted_time: int
 
     @classmethod
     def from_cam(cls, cam: dict, initial_covariance: np.ndarray):
         # Step 1: Initialize a new track from the first CAM measurement.
         pos = parse_position(cam["sender"]["pos"])
         velocity = velocity_from_cam(cam)
+        acceleration = acceleration_from_cam(cam)
         kf = KalmanFilter(dim_x=4, dim_z=4)
         kf.x = np.array([pos[0], pos[1], velocity[0], velocity[1]], dtype=float)
         kf.P = initial_covariance.copy()  # Starting uncertainty for a new vehicle track.
         kf.H = np.eye(4)
         time_ns = int(cam["rcvTime"])
-        return cls(str(cam["sender_id"]), int(cam.get("sender_alias", 0)), kf, time_ns, time_ns)
+        return cls(
+            station_id=str(cam["sender_id"]),
+            station_alias=int(cam.get("sender_alias", 0)),
+            filter=kf,
+            last_acceleration=acceleration,
+            last_update_time=time_ns,
+            last_accepted_time=time_ns,
+        )
 
     def predict_state(self, time_ns: int):
         state = self.filter.x.copy()
         dt = max(0.0, (int(time_ns) - self.last_update_time) / 1_000_000_000.0)
-        state[0] += state[2] * dt
-        state[1] += state[3] * dt
+        state[0] += state[2] * dt + 0.5 * self.last_acceleration[0] * dt**2
+        state[1] += state[3] * dt + 0.5 * self.last_acceleration[1] * dt**2
+        state[2] += self.last_acceleration[0] * dt
+        state[3] += self.last_acceleration[1] * dt
         return state
 
     def predict_to(self, time_ns: int):
@@ -67,8 +88,14 @@ class KalmanTrack:
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0],
         ])
+        self.filter.B = np.array([
+            [0.5 * dt**2, 0.0],
+            [0.0, 0.5 * dt**2],
+            [dt, 0.0],
+            [0.0, dt],
+        ])
         self.filter.Q = np.eye(4) * max(dt, 1e-3)  # Small process noise for motion uncertainty.
-        self.filter.predict()
+        self.filter.predict(u=self.last_acceleration)
         self.last_update_time = int(time_ns)
 
     def errors_against_cam(self, cam: dict):
@@ -83,10 +110,11 @@ class KalmanTrack:
     def update_from_cam(self, cam: dict, measurement_noise: np.ndarray):
         # Step 4: Correct the predicted track with the accepted CAM measurement.
         self.predict_to(int(cam["rcvTime"]))
-        self.last_seen_time = int(cam["rcvTime"])
+        self.last_accepted_time = int(cam["rcvTime"])
         pos = parse_position(cam["sender"]["pos"])
         velocity = velocity_from_cam(cam)
         measurement = np.array([pos[0], pos[1], velocity[0], velocity[1]], dtype=float)
         self.filter.R = measurement_noise
         self.filter.update(measurement)
+        self.last_acceleration = acceleration_from_cam(cam)
         self.station_alias = int(cam.get("sender_alias", self.station_alias))

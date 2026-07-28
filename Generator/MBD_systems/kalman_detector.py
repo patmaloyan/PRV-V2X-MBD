@@ -13,11 +13,14 @@ POSITION_THRESHOLD_M = 10
 SPEED_THRESHOLD_MPS = 10
 CPM_OBJECT_POSITION_THRESHOLD_M = 10
 CPM_OBJECT_SPEED_THRESHOLD_MPS = 10
+EGO_OBJECT_POSITION_THRESHOLD_M = 10
+EGO_OBJECT_SPEED_THRESHOLD_MPS = 5
 WIRELESS_RANGE_M = 300.0
 RANGE_MARGIN_M = 50.0
 EGO_LOOKBACK_NS = 2_000_000_000
 CPM_SENSOR_RANGE_M = 80.0
-TRACK_EXPIRY_NS = 10_000_000_000
+PSEUDONYM_INTERVAL_S = 20
+TRACK_EXPIRY_NS = PSEUDONYM_INTERVAL_S * 1_000_000_000
 
 
 class CamOnlyKalmanDetector:
@@ -68,15 +71,11 @@ class CamOnlyKalmanDetector:
         current_time = int(message["rcvTime"])
         active_tracks = []
         for track in self.tracks:
-            if current_time - track.last_seen_time <= TRACK_EXPIRY_NS:
+            if current_time - track.last_accepted_time <= TRACK_EXPIRY_NS:
                 active_tracks.append(track)
             elif self.tracks_by_station_id.get(track.station_id) is track:
                 self.tracks_by_station_id.pop(track.station_id)
         self.tracks = active_tracks
-
-        known_track = self.tracks_by_station_id.get(str(message["sender_id"]))
-        if known_track is not None:
-            known_track.last_seen_time = current_time
 
     def known_station_id_check(self, cam: dict):
         track = self.tracks_by_station_id.get(str(cam["sender_id"]))
@@ -166,12 +165,17 @@ class CamOnlyKalmanDetector:
             obj_pos = parse_position(obj["global_pos"])
             pos_error = float(np.linalg.norm(cam_pos[0:2] - obj_pos[0:2]))
             speed_error = abs(cam_speed - float(obj["spd"]))
-            score = (pos_error / POSITION_THRESHOLD_M) + (speed_error / SPEED_THRESHOLD_MPS)
+            score = (
+                pos_error / EGO_OBJECT_POSITION_THRESHOLD_M
+                + speed_error / EGO_OBJECT_SPEED_THRESHOLD_MPS
+            )
             if score < best_score:
                 best_score = score
                 best_match = {"object_id": obj.get("object_id"), "pos_error": pos_error, "speed_error": speed_error}
 
-        if best_match and errors_within_threshold(best_match["pos_error"], best_match["speed_error"]):
+        if best_match and ego_errors_within_threshold(
+            best_match["pos_error"], best_match["speed_error"]
+        ):
             return best_match
         return None
 
@@ -271,7 +275,7 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
                 # CPM object data is indirect: it may confirm a track, but must not update it.
                 edge_results = []
                 for matched_track in matched_tracks:
-                    matched_track.last_seen_time = int(cpm["rcvTime"])
+                    matched_track.last_accepted_time = int(cpm["rcvTime"])
                     edge_results.append(self.on_perceived_object_match(cpm, matched_track))
                 counts["cpm_objects_matched"] += 1
                 event = {"object_id": object_id, "action": "matched"}
@@ -467,6 +471,13 @@ def cpm_object_errors_within_threshold(pos_error, speed_error):
     return (
         pos_error <= CPM_OBJECT_POSITION_THRESHOLD_M
         and speed_error <= CPM_OBJECT_SPEED_THRESHOLD_MPS
+    )
+
+
+def ego_errors_within_threshold(pos_error, speed_error):
+    return (
+        pos_error <= EGO_OBJECT_POSITION_THRESHOLD_M
+        and speed_error <= EGO_OBJECT_SPEED_THRESHOLD_MPS
     )
 
 

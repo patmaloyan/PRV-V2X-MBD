@@ -10,8 +10,9 @@ import shutil
 from pathlib import Path
 
 ATTACK_RATIO = 0.2
+FIXED_POSITION_OFFSET_M = 50.0
 
-# CPM-addition: sender fields copied from attacked CAMs into attacker CPM sender blocks.
+# Sender fields cached per transmitted message so repeated receptions share one attacked sender state.
 SENDER_STATE_FIELDS = [
     'sender_pos_lat',
     'sender_pos_lon',
@@ -40,7 +41,9 @@ sumo_config = args.sumoConf
 misbehaviorOptions = [
     "timeDelayAttack",
     "constantPositionOffset",
+    "constantPositionOffsetFixed",
     "randomPositionOffset",
+    "randomPositionOffsetFixed",
     "positionMirroring",
     "constantSpeedOffset",
     "randomSpeedOffset",
@@ -98,6 +101,11 @@ def random_float_with_intervals(pos_min, pos_max, neg_min, neg_max):
         return random.uniform(pos_min, pos_max)
     else:
         return random.uniform(neg_min, neg_max)
+
+
+def random_offset_with_magnitude(magnitude):
+    angle = random.uniform(0, 2 * math.pi)
+    return magnitude * math.cos(angle), magnitude * math.sin(angle)
 
 
 def reconstruct_nested(row):
@@ -245,26 +253,47 @@ def time_delay_attack(msg: pd.Series):
     return msg
 
 
+def get_message_cache_key(msg: pd.Series):
+    return msg['type'], msg['sender_id'], msg['messageID']
+
+
+def restore_cached_sender_state(msg: pd.Series, cached_sender: pd.Series):
+    for field in SENDER_STATE_FIELDS:
+        msg[field] = cached_sender[field]
+    msg['attacker'] = cached_sender['attacker']
+    return msg
+
+
+def cache_sender_state(msg: pd.Series):
+    return msg[SENDER_STATE_FIELDS + ['attacker']].copy()
+
+
 def random_position_offset(msg: pd.Series):
     global messages_lookup
 
-    if msg['messageID'] in messages_lookup:
-        attack_msg = messages_lookup[msg['messageID']].copy()
-        attack_msg['receiver_pos'] = msg['receiver_pos']
-        attack_msg['receiver_pos_noise'] = msg['receiver_pos_noise']
-        attack_msg['receiver_spd'] = msg['receiver_spd']
-        attack_msg['receiver_spd_noise'] = msg['receiver_spd_noise']
-        attack_msg['receiver_acl'] = msg['receiver_acl']
-        attack_msg['receiver_acl_noise'] = msg['receiver_acl_noise']
-        attack_msg['receiver_hed'] = msg['receiver_hed']
-        attack_msg['receiver_hed_noise'] = msg['receiver_hed_noise']
-        attack_msg['receiver_driversProfile'] = msg['receiver_driversProfile']
-        return attack_msg
+    cache_key = get_message_cache_key(msg)
+    if cache_key in messages_lookup:
+        return restore_cached_sender_state(msg, messages_lookup[cache_key])
 
     msg['sender_pos_lat'] += random_float_with_intervals(20, 70, -70, -20)
     msg['sender_pos_lon'] += random_float_with_intervals(20, 70, -70, -20)
     msg['attacker'] = 1
-    messages_lookup[msg['messageID']] = msg.copy()
+    messages_lookup[cache_key] = cache_sender_state(msg)
+    return msg
+
+
+def random_position_offset_fixed(msg: pd.Series):
+    global messages_lookup
+
+    cache_key = get_message_cache_key(msg)
+    if cache_key in messages_lookup:
+        return restore_cached_sender_state(msg, messages_lookup[cache_key])
+
+    offset_lat, offset_lon = random_offset_with_magnitude(FIXED_POSITION_OFFSET_M)
+    msg['sender_pos_lat'] += offset_lat
+    msg['sender_pos_lon'] += offset_lon
+    msg['attacker'] = 1
+    messages_lookup[cache_key] = cache_sender_state(msg)
     return msg
 
 
@@ -287,22 +316,13 @@ def constant_speed_offset(msg: pd.Series):
 def random_speed_offset(msg: pd.Series):
     global messages_lookup
 
-    if msg['messageID'] in messages_lookup:
-        attack_msg = messages_lookup[msg['messageID']].copy()
-        attack_msg['receiver_pos'] = msg['receiver_pos']
-        attack_msg['receiver_pos_noise'] = msg['receiver_pos_noise']
-        attack_msg['receiver_spd'] = msg['receiver_spd']
-        attack_msg['receiver_spd_noise'] = msg['receiver_spd_noise']
-        attack_msg['receiver_acl'] = msg['receiver_acl']
-        attack_msg['receiver_acl_noise'] = msg['receiver_acl_noise']
-        attack_msg['receiver_hed'] = msg['receiver_hed']
-        attack_msg['receiver_hed_noise'] = msg['receiver_hed_noise']
-        attack_msg['receiver_driversProfile'] = msg['receiver_driversProfile']
-        return attack_msg
+    cache_key = get_message_cache_key(msg)
+    if cache_key in messages_lookup:
+        return restore_cached_sender_state(msg, messages_lookup[cache_key])
 
     msg['sender_spd'] += random_float_with_intervals(1, 7, -7, -1)
     msg['attacker'] = 1
-    messages_lookup[msg['messageID']] = msg.copy()
+    messages_lookup[cache_key] = cache_sender_state(msg)
     return msg
 
 
@@ -678,6 +698,49 @@ def prepare_message_dataframe(data, message_type):
     return df
 
 
+def get_manipulation_function():
+    if args.misbehavior in ["mixAll", "mixThree"]:
+        return mixed_dispatcher
+
+    match args.misbehavior:
+        case "constantPositionOffset":
+            return constant_position_offset
+        case "constantPositionOffsetFixed":
+            return constant_position_offset
+        case "timeDelayAttack":
+            return time_delay_attack
+        case "randomPositionOffset":
+            return random_position_offset
+        case "randomPositionOffsetFixed":
+            return random_position_offset_fixed
+        case "positionMirroring":
+            return position_mirroring
+        case "constantSpeedOffset":
+            return constant_speed_offset
+        case "randomSpeedOffset":
+            return random_speed_offset
+        case "zeroSpeedReport":
+            return zero_speed_report
+        case "suddenStop":
+            return sudden_stop
+        case "suddenConstantSpeed":
+            return sudden_stop_speed
+        case "reversedHeading":
+            return reversed_heading
+        case "feignedBraking":
+            return feigned_braking
+        case "accelerationMultiplication":
+            return acl_multiplication
+        case "dosAttack":
+            return dos_attack
+        case "trafficCongestionSybil":
+            return traffic_congestion_sybil
+        case "dataReplay":
+            return insert_data_replay
+        case _:
+            raise ValueError(f"Misbehavior '{args.misbehavior}' was not found!")
+
+
 def process_single_file(json_file):
     global df
     global misbehavior_config
@@ -685,7 +748,6 @@ def process_single_file(json_file):
     global attackerIDs
     global messages_lookup
     global sender_lookup
-    global attacked_cam_timeline
 
     with open(json_file, 'r', encoding='utf-8') as f:
         data = json.load(f)
@@ -699,43 +761,7 @@ def process_single_file(json_file):
     df.sort_values(by='rcvTime', ascending=True, inplace=True)
 
     df_attack = df.copy()
-    # Setup manipulation function
-    if args.misbehavior in ["mixAll", "mixThree"]:
-        manipulation_function = mixed_dispatcher
-    else:
-        match args.misbehavior:
-            case "constantPositionOffset":
-                manipulation_function = constant_position_offset
-            case "timeDelayAttack":
-                manipulation_function = time_delay_attack
-            case "randomPositionOffset":
-                manipulation_function = random_position_offset
-            case "positionMirroring":
-                manipulation_function = position_mirroring
-            case "constantSpeedOffset":
-                manipulation_function = constant_speed_offset
-            case "randomSpeedOffset":
-                manipulation_function = random_speed_offset
-            case "zeroSpeedReport":
-                manipulation_function = zero_speed_report
-            case "suddenStop":
-                manipulation_function = sudden_stop
-            case "suddenConstantSpeed":
-                manipulation_function = sudden_stop_speed
-            case "reversedHeading":
-                manipulation_function = reversed_heading
-            case "feignedBraking":
-                manipulation_function = feigned_braking
-            case "accelerationMultiplication":
-                manipulation_function = acl_multiplication
-            case "dosAttack":
-                manipulation_function = dos_attack
-            case "trafficCongestionSybil":
-                manipulation_function = traffic_congestion_sybil
-            case "dataReplay":
-                manipulation_function = insert_data_replay
-            case _:
-                raise ValueError(f"Misbehavior '{args.misbehavior}' was not found!")
+    manipulation_function = get_manipulation_function()
 
     # Apply misbehavior
     df.loc[df['sender_id'].isin(attackerIDs)] = df.loc[df['sender_id'].isin(attackerIDs)].apply(manipulation_function,
@@ -756,16 +782,6 @@ def process_single_file(json_file):
 
     df.sort_values(by='rcvTime', ascending=True, inplace=True)
 
-    for sender_id, sender_df in df.groupby('sender_id'):
-        # CPM-addition: keep attacked CAM history for later CPM sender synchronization.
-        sender_timeline = sender_df.sort_values(by='sendTime').copy()
-        if sender_id in attacked_cam_timeline:
-            attacked_cam_timeline[sender_id] = pd.concat(
-                [attacked_cam_timeline[sender_id], sender_timeline], ignore_index=True
-            ).sort_values(by='sendTime')
-        else:
-            attacked_cam_timeline[sender_id] = sender_timeline
-
     # Convert back to nested structure
     nested_data = df.apply(reconstruct_nested, axis=1).tolist()
 
@@ -775,36 +791,8 @@ def process_single_file(json_file):
         json.dump(nested_data, f, indent=4)
 
 
-def find_latest_prior_attacked_cam(sender_id, send_time):
-    # CPM-addition: use latest prior CAM to avoid copying future sender state into CPM.
-    sender_timeline = attacked_cam_timeline.get(sender_id)
-    if sender_timeline is None or sender_timeline.empty:
-        return None
-
-    prior_messages = sender_timeline[sender_timeline['sendTime'] <= send_time]
-    if prior_messages.empty:
-        return None
-
-    return prior_messages.iloc[-1]
-
-
-def sync_cpm_sender_with_attacked_cam(row):
-    if row['sender_id'] not in attackerIDs:
-        return row
-
-    cam_row = find_latest_prior_attacked_cam(row['sender_id'], row['sendTime'])
-    if cam_row is None:
-        return row
-
-    for field in SENDER_STATE_FIELDS:
-        row[field] = cam_row[field]
-
-    row['attacker'] = cam_row['attacker']
-    return row
-
-
 def process_cpm_file(json_file):
-    # CPM-addition: update attacker CPM sender state while keeping receiver/perceivedObjects intact.
+    # Apply the selected attack to the CPM's own sender state, just as for CAM.
     with open(json_file, 'r', encoding='utf-8') as f:
         data = json.load(f)
 
@@ -815,7 +803,9 @@ def process_cpm_file(json_file):
     df_cpm = prepare_message_dataframe(data, 'CPM')
     df_cpm['perceivedObjects'] = [msg.get('perceivedObjects', []) for msg in data]
     df_cpm.sort_values(by='rcvTime', ascending=True, inplace=True)
-    df_cpm = df_cpm.apply(sync_cpm_sender_with_attacked_cam, axis=1)
+    manipulation_function = get_manipulation_function()
+    attacker_mask = df_cpm['sender_id'].isin(attackerIDs)
+    df_cpm.loc[attacker_mask] = df_cpm.loc[attacker_mask].apply(manipulation_function, axis=1)
     df_cpm.sort_values(by='rcvTime', ascending=True, inplace=True)
 
     nested_data = df_cpm.apply(reconstruct_cpm_nested, axis=1).tolist()
@@ -893,6 +883,11 @@ def set_up_misbehavior_config():
                 for attacker_id in attackerIDs:
                     misbehavior_config[attacker_id]["offset_lat"] = random_float_with_intervals(20, 70, -70, -20)
                     misbehavior_config[attacker_id]["offset_lon"] = random_float_with_intervals(20, 70, -70, -20)
+            case "constantPositionOffsetFixed":
+                for attacker_id in attackerIDs:
+                    offset_lat, offset_lon = random_offset_with_magnitude(FIXED_POSITION_OFFSET_M)
+                    misbehavior_config[attacker_id]["offset_lat"] = offset_lat
+                    misbehavior_config[attacker_id]["offset_lon"] = offset_lon
             case "timeDelayAttack":
                 for attacker_id in attackerIDs:
                     misbehavior_config[attacker_id]["timeDelay"] = random.randint(2000000000, 4000000000)
@@ -937,7 +932,6 @@ if __name__ == "__main__":
     messages_lookup = {}
     sender_lookup = {}
     misbehavior_config['ratio'] = ATTACK_RATIO
-    attacked_cam_timeline = {}
     output_dir = input_folder.parent / f"{input_folder.name}_{args.misbehavior}"
     # CPM-addition: support datasets split into cam/ and cpm/ folders.
     cam_input_dir = input_folder / 'cam' if (input_folder / 'cam').is_dir() else input_folder
@@ -1076,7 +1070,7 @@ if __name__ == "__main__":
                                 if not f.stem.endswith(tuple(misbehaviorOptions))]
         for index, json_file in enumerate(cpm_files_to_process, start=1):
             process_cpm_file(json_file)
-            print(f"Processing CPM consistency for file {index}/{len(cpm_files_to_process)}: {json_file.name}")
+            print(f"Processing CPM misbehavior for file {index}/{len(cpm_files_to_process)}: {json_file.name}")
 
     if ego_input_dir is not None:
         ego_files_to_process = [f for f in ego_input_dir.glob('*.json')

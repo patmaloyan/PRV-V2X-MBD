@@ -218,6 +218,86 @@ def parse_position(pos_string: str) -> Tuple[float, float, float]:
     return float(parts[0]), float(parts[1]), float(parts[2])
 
 
+def velocity_vector(speed, heading):
+    heading_rad = math.radians(float(heading))
+    return np.array([
+        float(speed) * math.sin(heading_rad),
+        float(speed) * math.cos(heading_rad),
+        0.0,
+    ])
+
+
+def format_vector(vector):
+    return f"{vector[0]},{vector[1]},{vector[2]}"
+
+
+def reconcile_cpm_perceived_objects(msg: pd.Series):
+    """Keep perceived-object global state fixed after attacking the CPM sender."""
+    objects = msg.get('perceivedObjects', [])
+    if not isinstance(objects, list):
+        return msg
+
+    sender_position = np.array([
+        float(msg['sender_pos_lat']),
+        float(msg['sender_pos_lon']),
+        float(msg['sender_pos_alt']),
+    ])
+    sender_velocity = velocity_vector(msg['sender_spd'], msg['sender_hed'])
+    original_sender_position = np.array([
+        float(msg.get('_original_sender_pos_lat', msg['sender_pos_lat'])),
+        float(msg.get('_original_sender_pos_lon', msg['sender_pos_lon'])),
+        float(msg.get('_original_sender_pos_alt', msg['sender_pos_alt'])),
+    ])
+    original_sender_velocity = velocity_vector(
+        msg.get('_original_sender_spd', msg['sender_spd']),
+        msg.get('_original_sender_hed', msg['sender_hed']),
+    )
+
+    reconciled_objects = []
+    for perceived_object in objects:
+        if not isinstance(perceived_object, dict):
+            reconciled_objects.append(perceived_object)
+            continue
+
+        reconciled_object = perceived_object.copy()
+        try:
+            if 'global_pos' in perceived_object:
+                object_position = np.array(
+                    parse_position(str(perceived_object['global_pos']))
+                )
+            else:
+                object_position = (
+                    original_sender_position
+                    + np.array(parse_position(str(perceived_object['rel_pos'])))
+                )
+            reconciled_object['rel_pos'] = format_vector(
+                object_position - sender_position
+            )
+        except (KeyError, TypeError, ValueError, IndexError):
+            pass
+
+        try:
+            if 'spd' in perceived_object and 'hed' in perceived_object:
+                object_velocity = velocity_vector(
+                    perceived_object['spd'], perceived_object['hed']
+                )
+            else:
+                object_velocity = (
+                    original_sender_velocity
+                    + np.array(parse_position(str(perceived_object['rel_vel'])))
+                )
+            reconciled_object['rel_vel'] = format_vector(
+                object_velocity - sender_velocity
+            )
+        except (KeyError, TypeError, ValueError, IndexError):
+            pass
+
+        reconciled_objects.append(reconciled_object)
+
+    msg['perceivedObjects'] = reconciled_objects
+    return msg
+
+
 def start_sumo():
     sumo_binary = "sumo"
     traci.start([sumo_binary, "-c", sumo_config, "--no-step-log", "true"])
@@ -802,10 +882,20 @@ def process_cpm_file(json_file):
 
     df_cpm = prepare_message_dataframe(data, 'CPM')
     df_cpm['perceivedObjects'] = [msg.get('perceivedObjects', []) for msg in data]
+    # Preserve the sender reference state needed to reconcile relative object data
+    # after an attack, including future inputs that no longer carry global_pos.
+    for field in [
+        'sender_pos_lat', 'sender_pos_lon', 'sender_pos_alt',
+        'sender_spd', 'sender_hed',
+    ]:
+        df_cpm[f'_original_{field}'] = df_cpm[field]
     df_cpm.sort_values(by='rcvTime', ascending=True, inplace=True)
     manipulation_function = get_manipulation_function()
     attacker_mask = df_cpm['sender_id'].isin(attackerIDs)
     df_cpm.loc[attacker_mask] = df_cpm.loc[attacker_mask].apply(manipulation_function, axis=1)
+    # CPM object state is independent of attacks against the originating station.
+    # Rebuild its relative position/velocity from the unchanged absolute object state.
+    df_cpm = df_cpm.apply(reconcile_cpm_perceived_objects, axis=1)
     df_cpm.sort_values(by='rcvTime', ascending=True, inplace=True)
 
     nested_data = df_cpm.apply(reconstruct_cpm_nested, axis=1).tolist()

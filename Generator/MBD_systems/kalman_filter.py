@@ -14,6 +14,15 @@ SENSOR_MEASUREMENT_COVARIANCE = np.diag([
     0.25,
     0.25,
 ])
+# Unmodelled acceleration uncertainty used by the constant-acceleration process model.
+PROCESS_ACCELERATION_STD_MPS2 = 3.1
+
+
+@dataclass(frozen=True)
+class KalmanDeviation:
+    position_error: float
+    speed_error: float
+    nis: float
 
 
 def parse_position(pos_string: str) -> np.ndarray:
@@ -38,9 +47,36 @@ def acceleration_from_cam(cam: dict) -> np.ndarray:
     ], dtype=float)
 
 
+def measurement_from_cam(cam: dict) -> np.ndarray:
+    pos = parse_position(cam["sender"]["pos"])
+    velocity = velocity_from_cam(cam)
+    return np.array([pos[0], pos[1], velocity[0], velocity[1]], dtype=float)
+
+
+def motion_matrices(dt: float):
+    transition = np.array([
+        [1.0, 0.0, dt, 0.0],
+        [0.0, 1.0, 0.0, dt],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ])
+    control = np.array([
+        [0.5 * dt**2, 0.0],
+        [0.0, 0.5 * dt**2],
+        [dt, 0.0],
+        [0.0, dt],
+    ])
+    process_noise = PROCESS_ACCELERATION_STD_MPS2**2 * np.array([
+        [dt**4 / 4.0, 0.0, dt**3 / 2.0, 0.0],
+        [0.0, dt**4 / 4.0, 0.0, dt**3 / 2.0],
+        [dt**3 / 2.0, 0.0, dt**2, 0.0],
+        [0.0, dt**3 / 2.0, 0.0, dt**2],
+    ])
+    return transition, control, process_noise
+
+
 @dataclass
 class KalmanTrack:
-    station_id: str
     station_alias: int
     filter: KalmanFilter
     last_acceleration: np.ndarray
@@ -59,7 +95,6 @@ class KalmanTrack:
         kf.H = np.eye(4)
         time_ns = int(cam["rcvTime"])
         return cls(
-            station_id=str(cam["sender_id"]),
             station_alias=int(cam.get("sender_alias", 0)),
             filter=kf,
             last_acceleration=acceleration,
@@ -67,14 +102,19 @@ class KalmanTrack:
             last_accepted_time=time_ns,
         )
 
-    def predict_state(self, time_ns: int):
-        state = self.filter.x.copy()
+    def predict_candidate(self, time_ns: int):
         dt = max(0.0, (int(time_ns) - self.last_update_time) / 1_000_000_000.0)
-        state[0] += state[2] * dt + 0.5 * self.last_acceleration[0] * dt**2
-        state[1] += state[3] * dt + 0.5 * self.last_acceleration[1] * dt**2
-        state[2] += self.last_acceleration[0] * dt
-        state[3] += self.last_acceleration[1] * dt
-        return state
+        if dt == 0:
+            return self.filter.x.copy(), self.filter.P.copy()
+
+        transition, control, process_noise = motion_matrices(dt)
+        predicted_state = (
+            transition @ self.filter.x + control @ self.last_acceleration
+        )
+        predicted_covariance = (
+            transition @ self.filter.P @ transition.T + process_noise
+        )
+        return predicted_state, predicted_covariance
 
     def predict_to(self, time_ns: int):
         # Step 2: Predict position and velocity at the new receive time.
@@ -82,38 +122,32 @@ class KalmanTrack:
         if dt == 0:
             return
 
-        self.filter.F = np.array([
-            [1.0, 0.0, dt, 0.0],
-            [0.0, 1.0, 0.0, dt],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ])
-        self.filter.B = np.array([
-            [0.5 * dt**2, 0.0],
-            [0.0, 0.5 * dt**2],
-            [dt, 0.0],
-            [0.0, dt],
-        ])
-        self.filter.Q = np.eye(4) * max(dt, 1e-3)  # Small process noise for motion uncertainty.
+        self.filter.F, self.filter.B, self.filter.Q = motion_matrices(dt)
         self.filter.predict(u=self.last_acceleration)
         self.last_update_time = int(time_ns)
 
-    def errors_against_cam(self, cam: dict):
-        # Step 3: Compare the prediction with the incoming CAM.
-        predicted = self.predict_state(int(cam["rcvTime"]))
-        pos = parse_position(cam["sender"]["pos"])
-        velocity = velocity_from_cam(cam)
-        pos_error = float(np.linalg.norm(predicted[0:2] - pos[0:2]))
-        speed_error = float(np.linalg.norm(predicted[2:4] - velocity))
-        return pos_error, speed_error
+    def deviation_against_cam(self, cam: dict, measurement_noise: np.ndarray):
+        # Step 3: Score the innovation without changing the accepted track.
+        predicted_state, predicted_covariance = self.predict_candidate(
+            int(cam["rcvTime"])
+        )
+        measurement = measurement_from_cam(cam)
+        innovation = measurement - predicted_state
+        innovation_covariance = predicted_covariance + measurement_noise
+        nis = float(
+            innovation @ np.linalg.solve(innovation_covariance, innovation)
+        )
+        return KalmanDeviation(
+            position_error=float(np.linalg.norm(innovation[0:2])),
+            speed_error=float(np.linalg.norm(innovation[2:4])),
+            nis=nis,
+        )
 
     def update_from_cam(self, cam: dict, measurement_noise: np.ndarray):
         # Step 4: Correct the predicted track with the accepted CAM measurement.
         self.predict_to(int(cam["rcvTime"]))
         self.last_accepted_time = int(cam["rcvTime"])
-        pos = parse_position(cam["sender"]["pos"])
-        velocity = velocity_from_cam(cam)
-        measurement = np.array([pos[0], pos[1], velocity[0], velocity[1]], dtype=float)
+        measurement = measurement_from_cam(cam)
         self.filter.R = measurement_noise
         self.filter.update(measurement)
         self.last_acceleration = acceleration_from_cam(cam)

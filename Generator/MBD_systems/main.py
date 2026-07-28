@@ -158,7 +158,11 @@ def main():
         metrics, debug_results = process_kalman_folder(input_folder)
         scenario_stats.append(metrics)
         aggregated_metrics = evaluate_predictions(scenario_stats)
-        for key in ["wireless_range_m", "range_margin_m", "total_messages"]:
+        for key in [
+            "wireless_range_m", "range_margin_m", "nis_threshold",
+            "max_nis_prediction_gap_s", "process_acceleration_std_mps2",
+            "total_messages",
+        ]:
             aggregated_metrics[key] = metrics.get(key)
         print(aggregated_metrics['f1'])
 
@@ -182,6 +186,8 @@ def main():
         aggregated_metrics = evaluate_predictions(scenario_stats)
         for key in [
             "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
+            "nis_threshold", "max_nis_prediction_gap_s",
+            "process_acceleration_std_mps2",
             "total_messages", "cam_messages", "cpm_messages",
         ]:
             aggregated_metrics[key] = metrics.get(key)
@@ -207,6 +213,8 @@ def main():
         aggregated_metrics = evaluate_predictions(scenario_stats)
         for key in [
             "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
+            "nis_threshold", "max_nis_prediction_gap_s",
+            "process_acceleration_std_mps2",
             "total_messages", "cam_messages", "cpm_messages",
         ]:
             aggregated_metrics[key] = metrics.get(key)
@@ -232,6 +240,8 @@ def main():
         aggregated_metrics = evaluate_predictions(scenario_stats)
         for key in [
             "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
+            "nis_threshold", "max_nis_prediction_gap_s",
+            "process_acceleration_std_mps2",
             "total_messages", "cam_messages", "cpm_messages",
         ]:
             aggregated_metrics[key] = metrics.get(key)

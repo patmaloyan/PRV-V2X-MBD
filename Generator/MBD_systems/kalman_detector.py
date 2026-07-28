@@ -1,20 +1,28 @@
 """Implements detection logic for known IDs, pseudonym changes, and new vehicles."""
 
 import json
+import math
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from kalman_filter import KalmanTrack, SENSOR_MEASUREMENT_COVARIANCE, parse_position
+from kalman_filter import (
+    KalmanTrack,
+    PROCESS_ACCELERATION_STD_MPS2,
+    SENSOR_MEASUREMENT_COVARIANCE,
+    parse_position,
+    velocity_from_cam,
+)
 
 
-POSITION_THRESHOLD_M = 10
-SPEED_THRESHOLD_MPS = 10
-CPM_OBJECT_POSITION_THRESHOLD_M = 10
-CPM_OBJECT_SPEED_THRESHOLD_MPS = 10
 EGO_OBJECT_POSITION_THRESHOLD_M = 10
 EGO_OBJECT_SPEED_THRESHOLD_MPS = 5
+# 99% chi-square threshold for the four measured values [x, y, vx, vy].
+NIS_THRESHOLD = 13.28
+# Do not authenticate against a Kalman prediction whose covariance has grown stale.
+MAX_NIS_PREDICTION_GAP_S = 2.0
+MAX_NIS_PREDICTION_GAP_NS = int(MAX_NIS_PREDICTION_GAP_S * 1_000_000_000)
 WIRELESS_RANGE_M = 300.0
 RANGE_MARGIN_M = 50.0
 EGO_LOOKBACK_NS = 2_000_000_000
@@ -26,7 +34,7 @@ TRACK_EXPIRY_NS = PSEUDONYM_INTERVAL_S * 1_000_000_000
 class CamOnlyKalmanDetector:
     def __init__(self):
         self.tracks = []
-        self.tracks_by_station_id = {}
+        self.tracks_by_station_alias = {}
         self.initial_covariance = SENSOR_MEASUREMENT_COVARIANCE.copy()
         self.measurement_noise = SENSOR_MEASUREMENT_COVARIANCE.copy()
 
@@ -56,8 +64,8 @@ class CamOnlyKalmanDetector:
     def process_cam(self, cam: dict, ego_snapshots: list[dict]):
         self.prepare_tracks_for_message(cam)
 
-        # Flowchart order: known ID, pseudonym change, then new vehicle.
-        known_result = self.known_station_id_check(cam)
+        # Flowchart order: known alias, pseudonym change, then new vehicle.
+        known_result = self.known_station_alias_check(cam, ego_snapshots)
         if known_result is not None:
             return known_result
 
@@ -73,47 +81,73 @@ class CamOnlyKalmanDetector:
         for track in self.tracks:
             if current_time - track.last_accepted_time <= TRACK_EXPIRY_NS:
                 active_tracks.append(track)
-            elif self.tracks_by_station_id.get(track.station_id) is track:
-                self.tracks_by_station_id.pop(track.station_id)
+            elif self.tracks_by_station_alias.get(track.station_alias) is track:
+                self.tracks_by_station_alias.pop(track.station_alias)
         self.tracks = active_tracks
 
-    def known_station_id_check(self, cam: dict):
-        track = self.tracks_by_station_id.get(str(cam["sender_id"]))
+    def known_station_alias_check(self, cam: dict, ego_snapshots: list[dict]):
+        track = self.tracks_by_station_alias.get(int(cam["sender_alias"]))
         if track is None:
             return None
 
-        pos_error, speed_error = track.errors_against_cam(cam)
-        if errors_within_threshold(pos_error, speed_error):
-            track.update_from_cam(cam, self.measurement_noise)
-            return decision(True, "known_id_accept", pos_error, speed_error, track.station_id)
+        deviation = track.deviation_against_cam(cam, self.measurement_noise)
+        if not nis_prediction_is_fresh(track, int(cam["rcvTime"])):
+            ego_match = self.find_ego_sensor_match(cam, ego_snapshots)
+            if ego_match is not None:
+                track.update_from_cam(cam, self.measurement_noise)
+                return decision(
+                    True, "known_alias_stale_ego_accept",
+                    ego_match["pos_error"], ego_match["speed_error"],
+                    track.station_alias, deviation.nis,
+                )
+            return decision(
+                False, "known_alias_stale_reject", deviation.position_error,
+                deviation.speed_error, track.station_alias, deviation.nis,
+            )
 
-        return decision(False, "known_id_reject", pos_error, speed_error, track.station_id)
+        if nis_within_threshold(deviation.nis):
+            track.update_from_cam(cam, self.measurement_noise)
+            return decision(
+                True, "known_alias_accept", deviation.position_error,
+                deviation.speed_error, track.station_alias, deviation.nis,
+            )
+
+        return decision(
+            False, "known_alias_reject", deviation.position_error,
+            deviation.speed_error, track.station_alias, deviation.nis,
+        )
 
     def pseudonym_change_check(self, cam: dict):
         best_track = None
         best_pos_error = None
         best_speed_error = None
+        best_nis = None
         best_score = float("inf")
 
         for track in self.tracks:
-            pos_error, speed_error = track.errors_against_cam(cam)
-            # Compute score based on normalized errrors.
-            score = (pos_error / POSITION_THRESHOLD_M) + (speed_error / SPEED_THRESHOLD_MPS)
+            if not nis_prediction_is_fresh(track, int(cam["rcvTime"])):
+                continue
+            deviation = track.deviation_against_cam(cam, self.measurement_noise)
+            score = deviation.nis
             if score < best_score:
                 best_track = track
-                best_pos_error = pos_error
-                best_speed_error = speed_error
+                best_pos_error = deviation.position_error
+                best_speed_error = deviation.speed_error
+                best_nis = deviation.nis
                 best_score = score
 
-        if best_track is None or not errors_within_threshold(best_pos_error, best_speed_error):
+        if best_track is None or not nis_within_threshold(best_nis):
             return None
 
-        old_station_id = best_track.station_id
-        self.tracks_by_station_id.pop(old_station_id, None)
-        best_track.station_id = str(cam["sender_id"])
-        self.tracks_by_station_id[best_track.station_id] = best_track
+        old_station_alias = best_track.station_alias
+        self.tracks_by_station_alias.pop(old_station_alias, None)
+        best_track.station_alias = int(cam["sender_alias"])
+        self.tracks_by_station_alias[best_track.station_alias] = best_track
         best_track.update_from_cam(cam, self.measurement_noise)
-        return decision(True, "pseudonym_accept", best_pos_error, best_speed_error, old_station_id)
+        return decision(
+            True, "pseudonym_accept", best_pos_error, best_speed_error,
+            old_station_alias, best_nis,
+        )
 
     def new_vehicle_check(self, cam: dict, ego_snapshots: list[dict]):
         # A new ID is accepted if it just entered, appears near range edge, or is seen by the receiver.
@@ -140,7 +174,7 @@ class CamOnlyKalmanDetector:
     def add_track(self, cam: dict):
         track = KalmanTrack.from_cam(cam, self.initial_covariance)
         self.tracks.append(track)
-        self.tracks_by_station_id[track.station_id] = track
+        self.tracks_by_station_alias[track.station_alias] = track
 
     def within_wireless_margin(self, cam: dict):
         receiver_pos = parse_position(cam["receiver"]["pos"])
@@ -159,12 +193,13 @@ class CamOnlyKalmanDetector:
         best_score = float("inf")
 
         for obj in snapshot.get("perceivedObjects", []):
-            if "global_pos" not in obj or "spd" not in obj:
+            object_state = relative_perceived_object_state(obj, snapshot)
+            if object_state is None:
                 continue
 
-            obj_pos = parse_position(obj["global_pos"])
+            obj_pos, obj_velocity = object_state
             pos_error = float(np.linalg.norm(cam_pos[0:2] - obj_pos[0:2]))
-            speed_error = abs(cam_speed - float(obj["spd"]))
+            speed_error = abs(cam_speed - float(np.linalg.norm(obj_velocity[0:2])))
             score = (
                 pos_error / EGO_OBJECT_POSITION_THRESHOLD_M
                 + speed_error / EGO_OBJECT_SPEED_THRESHOLD_MPS
@@ -185,7 +220,6 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
 
     def __init__(self):
         super().__init__()
-        self.anonymous_track_counter = 0
 
     def pre_source_decision(self, message: dict):
         return None
@@ -197,9 +231,9 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
         return {}
 
     def perceived_object_matches(self, measurement):
-        best_track, pos_error, speed_error = self.closest_track(measurement)
-        if best_track is not None and cpm_object_errors_within_threshold(pos_error, speed_error):
-            return [best_track]
+        best_track, deviation = self.closest_track(measurement)
+        if best_track is not None and nis_within_threshold(deviation.nis):
+            return [(best_track, deviation)]
         return []
 
     def process_receiver(self, cam_path: Path | None, cpm_path: Path | None, ego_path: Path | None):
@@ -263,7 +297,7 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
                 counts["cpm_object_events"].append({"object_id": object_id, "action": "out_of_range"})
                 continue
 
-            measurement = perceived_object_as_cam(perceived_object, int(cpm["rcvTime"]))
+            measurement = perceived_object_as_cam(perceived_object, cpm)
             if measurement is None:
                 counts["cpm_objects_malformed"] += 1
                 counts["cpm_object_events"].append({"object_id": object_id, "action": "malformed"})
@@ -274,11 +308,21 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
             if matched_tracks:
                 # CPM object data is indirect: it may confirm a track, but must not update it.
                 edge_results = []
-                for matched_track in matched_tracks:
+                deviations = []
+                for matched_track, deviation in matched_tracks:
                     matched_track.last_accepted_time = int(cpm["rcvTime"])
+                    deviations.append(deviation)
                     edge_results.append(self.on_perceived_object_match(cpm, matched_track))
                 counts["cpm_objects_matched"] += 1
-                event = {"object_id": object_id, "action": "matched"}
+                best_deviation = min(deviations, key=lambda item: item.nis)
+                event = {
+                    "object_id": object_id,
+                    "action": "matched",
+                    "pos_error": best_deviation.position_error,
+                    "speed_error": best_deviation.speed_error,
+                    "nis": best_deviation.nis,
+                    "normalized_nis": best_deviation.nis / NIS_THRESHOLD,
+                }
                 if len(edge_results) == 1:
                     event.update(edge_results[0])
                 else:
@@ -297,26 +341,23 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
 
     def closest_track(self, measurement: dict):
         best_track = None
-        best_pos_error = None
-        best_speed_error = None
+        best_deviation = None
         best_score = float("inf")
         for track in self.tracks:
-            pos_error, speed_error = track.errors_against_cam(measurement)
-            score = ( # use original thresholds for any score
-                pos_error / POSITION_THRESHOLD_M
-                + speed_error / SPEED_THRESHOLD_MPS
+            if not nis_prediction_is_fresh(track, int(measurement["rcvTime"])):
+                continue
+            deviation = track.deviation_against_cam(
+                measurement, self.measurement_noise
             )
+            score = deviation.nis
             if score < best_score:
                 best_track = track
-                best_pos_error = pos_error
-                best_speed_error = speed_error
+                best_deviation = deviation
                 best_score = score
-        return best_track, best_pos_error, best_speed_error
+        return best_track, best_deviation
 
     def add_anonymous_object_track(self, measurement: dict):
-        self.anonymous_track_counter += 1
         # Do not expose the CPM ground-truth object_id as an observable station identity.
-        measurement["sender_id"] = f"cpm_object_{self.anonymous_track_counter}"
         track = KalmanTrack.from_cam(measurement, self.initial_covariance)
         self.tracks.append(track)
 
@@ -337,6 +378,9 @@ def process_kalman_folder(input_folder: Path):
     metrics = calculate_metrics(results)
     metrics["wireless_range_m"] = WIRELESS_RANGE_M
     metrics["range_margin_m"] = RANGE_MARGIN_M
+    metrics["nis_threshold"] = NIS_THRESHOLD
+    metrics["max_nis_prediction_gap_s"] = MAX_NIS_PREDICTION_GAP_S
+    metrics["process_acceleration_std_mps2"] = PROCESS_ACCELERATION_STD_MPS2
     metrics["total_messages"] = int(len(results))
     return metrics, results
 
@@ -368,6 +412,9 @@ def process_cam_cpm_kalman_folder(input_folder: Path, detector_class=CamCpmKalma
     metrics["wireless_range_m"] = WIRELESS_RANGE_M
     metrics["range_margin_m"] = RANGE_MARGIN_M
     metrics["cpm_sensor_range_m"] = CPM_SENSOR_RANGE_M
+    metrics["nis_threshold"] = NIS_THRESHOLD
+    metrics["max_nis_prediction_gap_s"] = MAX_NIS_PREDICTION_GAP_S
+    metrics["process_acceleration_std_mps2"] = PROCESS_ACCELERATION_STD_MPS2
     metrics["total_messages"] = int(len(results))
     metrics["cam_messages"] = int((results["message_type"] == "CAM").sum())
     metrics["cpm_messages"] = int((results["message_type"] == "CPM").sum())
@@ -392,26 +439,44 @@ def combined_message_frame(cam_path: Path | None, cpm_path: Path | None):
     )
 
 
-def perceived_object_as_cam(perceived_object: dict, rcv_time: int):
+def relative_perceived_object_state(perceived_object: dict, reference: dict):
     if not isinstance(perceived_object, dict):
         return None
-    required = ("global_pos", "spd", "hed")
-    if any(key not in perceived_object for key in required):
-        return None
     try:
-        parse_position(perceived_object["global_pos"])
-        float(perceived_object["spd"])
-        float(perceived_object["hed"])
-    except (TypeError, ValueError, IndexError):
+        reference_position = parse_position(reference["sender"]["pos"])
+        relative_position = parse_position(perceived_object["rel_pos"])
+        object_position = reference_position + relative_position
+
+        if "rel_vel" in perceived_object:
+            relative_velocity = parse_position(perceived_object["rel_vel"])[0:2]
+            object_velocity = velocity_from_cam(reference) + relative_velocity
+        else:
+            # Transitional support for existing simulations where object speed and
+            # heading are ground-referenced but global position is not required.
+            object_velocity = velocity_from_cam({"sender": perceived_object})
+    except (KeyError, TypeError, ValueError, IndexError):
         return None
+
+    return object_position, object_velocity
+
+
+def perceived_object_as_cam(perceived_object: dict, cpm: dict):
+    object_state = relative_perceived_object_state(perceived_object, cpm)
+    if object_state is None:
+        return None
+    object_position, object_velocity = object_state
+    speed = float(np.linalg.norm(object_velocity[0:2]))
+    heading = (
+        math.degrees(math.atan2(object_velocity[0], object_velocity[1])) % 360.0
+        if speed > 0.0 else 0.0
+    )
     return {
-        "sender_id": "",
         "sender_alias": 0,
-        "rcvTime": int(rcv_time),
+        "rcvTime": int(cpm["rcvTime"]),
         "sender": {
-            "pos": perceived_object["global_pos"],
-            "spd": perceived_object["spd"],
-            "hed": perceived_object["hed"],
+            "pos": ",".join(str(value) for value in object_position),
+            "spd": speed,
+            "hed": heading,
         },
     }
 
@@ -463,15 +528,13 @@ def latest_ego_snapshot(ego_snapshots: list[dict], rcv_time: int):
     return latest
 
 
-def errors_within_threshold(pos_error, speed_error):
-    return pos_error <= POSITION_THRESHOLD_M and speed_error <= SPEED_THRESHOLD_MPS
+def nis_within_threshold(nis):
+    return nis <= NIS_THRESHOLD
 
 
-def cpm_object_errors_within_threshold(pos_error, speed_error):
-    return (
-        pos_error <= CPM_OBJECT_POSITION_THRESHOLD_M
-        and speed_error <= CPM_OBJECT_SPEED_THRESHOLD_MPS
-    )
+def nis_prediction_is_fresh(track, time_ns):
+    # last_update_time is the timestamp underlying the predicted state/covariance.
+    return int(time_ns) - track.last_update_time <= MAX_NIS_PREDICTION_GAP_NS
 
 
 def ego_errors_within_threshold(pos_error, speed_error):
@@ -492,11 +555,15 @@ def receiver_just_entered(cam: dict):
     return int(cam.get("receiver", {}).get("just_entered_communication_zone", 0))
 
 
-def decision(accepted: bool, reason: str, pos_error, speed_error, matched_id):
+def decision(
+    accepted: bool, reason: str, pos_error, speed_error, matched_id, nis=None
+):
     return {
         "accepted": accepted,
         "reason": reason,
         "pos_error": pos_error,
         "speed_error": speed_error,
+        "nis": nis,
+        "normalized_nis": nis / NIS_THRESHOLD if nis is not None else None,
         "matched_id": matched_id,
     }

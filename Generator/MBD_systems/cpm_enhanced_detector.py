@@ -4,8 +4,9 @@ from pathlib import Path
 
 from kalman_detector import (
     CamCpmKalmanDetector,
-    cpm_object_errors_within_threshold,
     decision,
+    nis_prediction_is_fresh,
+    nis_within_threshold,
     process_cam_cpm_kalman_folder,
 )
 
@@ -32,9 +33,13 @@ class CpmEnhancedDetector(CamCpmKalmanDetector):
     def perceived_object_matches(self, measurement):
         matches = []
         for track in self.tracks:
-            pos_error, speed_error = track.errors_against_cam(measurement)
-            if cpm_object_errors_within_threshold(pos_error, speed_error):
-                matches.append(track)
+            if not nis_prediction_is_fresh(track, int(measurement["rcvTime"])):
+                continue
+            deviation = track.deviation_against_cam(
+                measurement, self.measurement_noise
+            )
+            if nis_within_threshold(deviation.nis):
+                matches.append((track, deviation))
         return matches
 
     def prune_edges(self, now):
@@ -83,7 +88,7 @@ class CpmEnhancedDetector(CamCpmKalmanDetector):
         return None
 
     def on_perceived_object_match(self, cpm, matched_track):
-        if self.tracks_by_station_id.get(str(matched_track.station_id)) is not matched_track:
+        if self.tracks_by_station_alias.get(matched_track.station_alias) is not matched_track:
             return {"edge_added": False}
 
         # Graph identities are observable aliases, never simulation-only object_id values.

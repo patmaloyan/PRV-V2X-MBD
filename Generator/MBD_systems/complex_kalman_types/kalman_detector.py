@@ -1,4 +1,5 @@
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -7,6 +8,7 @@ import pandas as pd
 from Generator.MBD_systems.complex_kalman_types.kalman_filter import KalmanTrack as NisKalmanTrack
 from Generator.MBD_systems.complex_kalman_types.kalman_filter import measurement_gate as nis_measurement_gate
 from Generator.MBD_systems.complex_kalman_types.kalman_filter import parse_position
+from Generator.MBD_systems.complex_kalman_types.kalman_filter import velocity_from_cam
 from Generator.MBD_systems.complex_kalman_types.kalman_filter_fixed_gate import KalmanTrack as FixedGateKalmanTrack
 from Generator.MBD_systems.complex_kalman_types.kalman_filter_fixed_gate import measurement_gate as fixed_measurement_gate
 from Generator.MBD_systems.complex_kalman_types.kalman_filter_fixed_gate import POSITION_THRESHOLD_M, SPEED_THRESHOLD_MPS
@@ -143,7 +145,9 @@ class CamOnlyKalmanDetector:
         best_match = None
 
         for obj in snapshot.get("perceivedObjects", []):
-            measurement = perceived_object_as_cam(obj, int(cam["rcvTime"]))
+            measurement = perceived_object_as_cam(
+                obj, snapshot, int(cam["rcvTime"])
+            )
             if measurement is None:
                 continue
             gate = self.measurement_gate(measurement, cam)
@@ -213,7 +217,9 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
         counts["cpm_objects_observed"] = len(objects)
         for perceived_object in objects:
             object_id = perceived_object.get("object_id") if isinstance(perceived_object, dict) else None
-            measurement = perceived_object_as_cam(perceived_object, int(cpm["rcvTime"]))
+            measurement = perceived_object_as_cam(
+                perceived_object, cpm, int(cpm["rcvTime"])
+            )
             if measurement is None:
                 counts["cpm_objects_malformed"] += 1
                 counts["cpm_object_events"].append({"object_id": object_id, "action": "malformed"})
@@ -340,26 +346,43 @@ def combined_message_frame(cam_path: Path | None, cpm_path: Path | None):
     )
 
 
-def perceived_object_as_cam(perceived_object: dict, rcv_time: int):
+def relative_perceived_object_state(perceived_object: dict, reference: dict):
     if not isinstance(perceived_object, dict):
         return None
-    required = ("global_pos", "spd", "hed")
-    if any(key not in perceived_object for key in required):
-        return None
     try:
-        parse_position(perceived_object["global_pos"])
-        float(perceived_object["spd"])
-        float(perceived_object["hed"])
-    except (TypeError, ValueError, IndexError):
+        reference_position = parse_position(reference["sender"]["pos"])
+        relative_position = parse_position(perceived_object["rel_pos"])
+        object_position = reference_position + relative_position
+
+        if "rel_vel" in perceived_object:
+            relative_velocity = parse_position(perceived_object["rel_vel"])[0:2]
+            object_velocity = velocity_from_cam(reference) + relative_velocity
+        else:
+            object_velocity = velocity_from_cam({"sender": perceived_object})
+    except (KeyError, TypeError, ValueError, IndexError):
         return None
+
+    return object_position, object_velocity
+
+
+def perceived_object_as_cam(perceived_object: dict, reference: dict, rcv_time: int):
+    object_state = relative_perceived_object_state(perceived_object, reference)
+    if object_state is None:
+        return None
+    object_position, object_velocity = object_state
+    speed = float(np.linalg.norm(object_velocity[0:2]))
+    heading = (
+        math.degrees(math.atan2(object_velocity[0], object_velocity[1])) % 360.0
+        if speed > 0.0 else 0.0
+    )
     return {
         "sender_id": "",
         "sender_alias": 0,
         "rcvTime": int(rcv_time),
         "sender": {
-            "pos": perceived_object["global_pos"],
-            "spd": perceived_object["spd"],
-            "hed": perceived_object["hed"],
+            "pos": ",".join(str(value) for value in object_position),
+            "spd": speed,
+            "hed": heading,
         },
     }
 

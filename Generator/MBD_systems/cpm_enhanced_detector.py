@@ -11,8 +11,8 @@ from kalman_detector import (
 )
 
 
-EDGE_GRACE_NS = 3_000_000_000
-EDGE_TTL_NS = 6_000_000_000
+EDGE_GRACE_NS = 2_000_000_000
+EDGE_TTL_NS = 8_000_000_000
 
 
 def valid_alias(value):
@@ -24,16 +24,9 @@ def valid_alias(value):
 
 
 class CpmEnhancedDetector(CamCpmKalmanDetector):
-    def __init__(
-        self,
-        required_unreciprocated_edges=1,
-        edge_grace_ns=EDGE_GRACE_NS,
-        edge_ttl_ns=EDGE_TTL_NS,
-    ):
+    def __init__(self, required_unreciprocated_edges=1):
         super().__init__()
         self.required_unreciprocated_edges = required_unreciprocated_edges
-        self.edge_grace_ns = edge_grace_ns
-        self.edge_ttl_ns = edge_ttl_ns
         self.edges = {}
         self.last_unreciprocated_targets = []
 
@@ -55,7 +48,7 @@ class CpmEnhancedDetector(CamCpmKalmanDetector):
             for target in list(self.edges[source]):
                 timestamps = [
                     timestamp for timestamp in self.edges[source][target]
-                    if now - timestamp <= self.edge_ttl_ns
+                    if now - timestamp <= EDGE_TTL_NS
                 ]
                 if timestamps:
                     self.edges[source][target] = timestamps
@@ -79,7 +72,7 @@ class CpmEnhancedDetector(CamCpmKalmanDetector):
         return sorted(
             target for target, timestamps in self.edges.get(source, {}).items()
             # Allow grace seconds for the reverse observation to arrive.
-            if now - timestamps[0] >= self.edge_grace_ns
+            if now - timestamps[0] >= EDGE_GRACE_NS
             and source not in self.edges.get(target, {})
         )
 
@@ -115,17 +108,8 @@ class CpmEnhancedDetector(CamCpmKalmanDetector):
         }
 
 
-def process_cpm_enhanced_folder(
-    input_folder: Path,
-    required_unreciprocated_edges=1,
-    edge_grace_ns=EDGE_GRACE_NS,
-    edge_ttl_ns=EDGE_TTL_NS,
-):
+def process_cpm_enhanced_folder(input_folder: Path, required_unreciprocated_edges=1):
     return process_cam_cpm_kalman_folder(
         input_folder,
-        lambda: CpmEnhancedDetector(
-            required_unreciprocated_edges,
-            edge_grace_ns,
-            edge_ttl_ns,
-        ),
+        lambda: CpmEnhancedDetector(required_unreciprocated_edges),
     )

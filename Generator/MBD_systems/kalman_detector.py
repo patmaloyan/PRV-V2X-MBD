@@ -408,14 +408,17 @@ def process_cam_cpm_kalman_folder(input_folder: Path, detector_class=CamCpmKalma
         ))
 
     results = pd.concat(receiver_results, ignore_index=True)
-    metrics = calculate_metrics(results)
+    # CPMs still influence the shared tracks, but detector accuracy is measured
+    # only on CAM decisions so types 2-5 use the same evaluation population.
+    evaluated_results = results[results["message_type"] == "CAM"]
+    metrics = calculate_metrics(evaluated_results)
     metrics["wireless_range_m"] = WIRELESS_RANGE_M
     metrics["range_margin_m"] = RANGE_MARGIN_M
     metrics["cpm_sensor_range_m"] = CPM_SENSOR_RANGE_M
     metrics["nis_threshold"] = NIS_THRESHOLD
     metrics["max_nis_prediction_gap_s"] = MAX_NIS_PREDICTION_GAP_S
     metrics["process_acceleration_std_mps2"] = PROCESS_ACCELERATION_STD_MPS2
-    metrics["total_messages"] = int(len(results))
+    metrics["total_messages"] = int(len(evaluated_results))
     metrics["cam_messages"] = int((results["message_type"] == "CAM").sum())
     metrics["cpm_messages"] = int((results["message_type"] == "CPM").sum())
     return metrics, results

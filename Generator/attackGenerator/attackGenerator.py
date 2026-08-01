@@ -420,52 +420,49 @@ def zero_speed_report(msg: pd.Series):
 
 
 def sudden_stop(msg: pd.Series):
-    random_number = random.uniform(0, 1)
-    if misbehavior_config[msg['sender_id']]["msg"] is not None and misbehavior_config[msg['sender_id']]["stop_time"] < \
-            msg['sendTime']:
-        attack_msg = misbehavior_config[msg['sender_id']]["msg"].copy()
-        attack_msg["sender_alias"] = msg['sender_alias']
-        attack_msg['rcvTime'] = msg['rcvTime']
-        attack_msg['sendTime'] = msg['sendTime']
-        attack_msg['sender_id'] = msg['sender_id']
-        attack_msg['messageID'] = msg['messageID']
-        attack_msg['receiver_pos'] = msg['receiver_pos']
-        attack_msg['receiver_pos_noise'] = msg['receiver_pos_noise']
-        attack_msg['receiver_spd'] = msg['receiver_spd']
-        attack_msg['receiver_spd_noise'] = msg['receiver_spd_noise']
-        attack_msg['receiver_acl'] = msg['receiver_acl']
-        attack_msg['receiver_acl_noise'] = msg['receiver_acl_noise']
-        attack_msg['receiver_hed'] = msg['receiver_hed']
-        attack_msg['receiver_hed_noise'] = msg['receiver_hed_noise']
-        attack_msg['receiver_driversProfile'] = msg['receiver_driversProfile']
-        if msg['sender_spd'] > 1 or get_distance(msg['sender_pos'], attack_msg['sender_pos']) >= 20:
-            attack_msg['attacker'] = 1
-        return attack_msg
+    config = misbehavior_config[msg['sender_id']]
+    stopped_msg = config["msg"]
+    stop_time = config["stop_time"]
+    if stopped_msg is None or int(msg['sendTime']) < int(stop_time):
+        return msg
 
-    if misbehavior_config[msg['sender_id']]['stop_time'] is None and misbehavior_config[msg['sender_id']][
-        "suddenStop"] > random_number:
+    if int(msg['sendTime']) == int(stop_time):
         attacker = msg['sender_spd'] > 1 and msg['sender_acl'] >= 0
-        msg['sender_spd'] = 0
-        msg['sender_acl'] = 0
-        misbehavior_config[msg['sender_id']]["msg"] = msg.copy()
-        misbehavior_config[msg['sender_id']]['stop_time'] = msg['sendTime']
-        attack_msg = misbehavior_config[msg['sender_id']]["msg"].copy()
-        attack_msg["sender_alias"] = msg['sender_alias']
-        if attacker:
-            attack_msg['attacker'] = 1
-        attack_msg['receiver_pos'] = msg['receiver_pos']
-        attack_msg['receiver_pos_noise'] = msg['receiver_pos_noise']
-        attack_msg['receiver_spd'] = msg['receiver_spd']
-        attack_msg['receiver_spd_noise'] = msg['receiver_spd_noise']
-        attack_msg['receiver_acl'] = msg['receiver_acl']
-        attack_msg['receiver_acl_noise'] = msg['receiver_acl_noise']
-        attack_msg['receiver_hed'] = msg['receiver_hed']
-        attack_msg['receiver_hed_noise'] = msg['receiver_hed_noise']
-        attack_msg['receiver_driversProfile'] = msg['receiver_driversProfile']
-        return attack_msg
+    else:
+        attacker = (
+            msg['sender_spd'] > 1
+            or get_distance(msg['sender_pos'], stopped_msg['sender_pos']) >= 20
+        )
 
+    # Preserve the current reception and CPM payload; freeze only the sender
+    # state selected once from the deduplicated global CAM timeline.
+    for field in SENDER_STATE_FIELDS:
+        msg[field] = stopped_msg[field]
+    if attacker:
+        msg['attacker'] = 1
     return msg
 
+
+def prepare_sudden_stop_triggers():
+    """Choose one receiver-independent false-stop trigger per assigned attacker."""
+    for attacker_id in attackerIDs:
+        config = misbehavior_config[attacker_id]
+        assigned = config.get("assigned_misbehavior", args.misbehavior)
+        if assigned != "suddenStop":
+            continue
+
+        messages = df_all[df_all['sender_id'] == attacker_id].sort_values(
+            ['sendTime', 'messageID'], kind='mergesort'
+        )
+        for _, message in messages.iterrows():
+            if random.uniform(0, 1) >= config["suddenStop"]:
+                continue
+            stopped_msg = message.copy()
+            stopped_msg['sender_spd'] = 0
+            stopped_msg['sender_acl'] = 0
+            config["msg"] = stopped_msg
+            config["stop_time"] = int(message['sendTime'])
+            break
 
 def sudden_stop_speed(msg: pd.Series):
     random_number = random.uniform(0, 1)
@@ -1103,6 +1100,7 @@ if __name__ == "__main__":
         misbehavior_config[attacker_id] = {}
 
     set_up_misbehavior_config()
+    prepare_sudden_stop_triggers()
 
     if args.misbehavior in ["mixAll", "mixThree"]:
         print(f"\n[INFO] Misbehavior assignment for {args.misbehavior}:")

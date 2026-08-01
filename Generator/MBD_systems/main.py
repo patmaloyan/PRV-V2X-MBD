@@ -11,6 +11,11 @@ import pandas as pd
 from data_structures import Parameters
 from cpm_enhanced_detector import process_cpm_enhanced_folder
 from kalman_detector import process_cam_cpm_kalman_folder, process_kalman_folder
+from weighted_reciprocity_detector import (
+    process_maintained_trust_reciprocity_folder,
+    process_no_anonymous_maintained_trust_folder,
+    process_weighted_reciprocity_folder,
+)
 
 
 def worker_process_json(input_file: str, option: int, params_dict: Dict[str, Any], source_file: str):
@@ -82,7 +87,9 @@ def main():
     parser.add_argument("--input_folder", help="Pfad zu den Eingabedateien", required=True)
     parser.add_argument(
         "--type",
-        help="0 = catch-checks, 1 = legacy checks, 2 = CAM-only Kalman, 3 = CAM+CPM Kalman, 4 = reciprocal CPM Kalman, 5 = two-edge reciprocal CPM Kalman",
+        type=int,
+        choices=range(9),
+        help="0 = catch-checks, 1 = legacy checks, 2 = CAM-only Kalman, 3 = CAM+CPM Kalman, 4 = reciprocal CPM Kalman, 5 = two-edge reciprocal CPM Kalman, 6 = three-score average reciprocity, 7 = maintained-trust reciprocity, 8 = maintained trust without anonymous CPM tracks",
         required=True,
     )
     parser.add_argument("--train", type=float)
@@ -256,6 +263,107 @@ def main():
                 json.dump(aggregated_metrics, f, indent=4)
             with open(debug_file, 'w') as f:
                 json.dump(debug_results.where(pd.notnull(debug_results), None).to_dict(orient='records'), f, indent=4)
+            print(f"Saved debug in {debug_file}")
+        return
+
+    if int(args.type) == 6:
+        metrics, debug_results = process_weighted_reciprocity_folder(input_folder)
+        scenario_stats.append(metrics)
+        aggregated_metrics = evaluate_predictions(scenario_stats)
+        for key in [
+            "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
+            "nis_threshold", "max_nis_prediction_gap_s",
+            "process_acceleration_std_mps2",
+            "total_messages", "cam_messages", "cpm_messages",
+        ]:
+            aggregated_metrics[key] = metrics.get(key)
+        print(aggregated_metrics['f1'])
+
+        if args.train == 0:
+            output_dir = result_directory(
+                input_folder, "kalman_cam_cpm_averaged_reciprocity"
+            )
+            output_file = output_dir / "predicted.json"
+            debug_file = output_dir / "debug.json"
+            print(f"Saved in {output_file}")
+            with open(output_file, 'w') as f:
+                json.dump(aggregated_metrics, f, indent=4)
+            with open(debug_file, 'w') as f:
+                json.dump(
+                    debug_results.where(pd.notnull(debug_results), None)
+                    .to_dict(orient='records'),
+                    f,
+                    indent=4,
+                )
+            print(f"Saved debug in {debug_file}")
+        return
+
+    if int(args.type) == 7:
+        metrics, debug_results = process_maintained_trust_reciprocity_folder(
+            input_folder
+        )
+        scenario_stats.append(metrics)
+        aggregated_metrics = evaluate_predictions(scenario_stats)
+        for key in [
+            "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
+            "nis_threshold", "max_nis_prediction_gap_s",
+            "process_acceleration_std_mps2",
+            "total_messages", "cam_messages", "cpm_messages",
+        ]:
+            aggregated_metrics[key] = metrics.get(key)
+        print(aggregated_metrics['f1'])
+
+        if args.train == 0:
+            output_dir = result_directory(
+                input_folder, "kalman_cam_cpm_maintained_trust_reciprocity"
+            )
+            output_file = output_dir / "predicted.json"
+            debug_file = output_dir / "debug.json"
+            print(f"Saved in {output_file}")
+            with open(output_file, 'w') as f:
+                json.dump(aggregated_metrics, f, indent=4)
+            with open(debug_file, 'w') as f:
+                json.dump(
+                    debug_results.where(pd.notnull(debug_results), None)
+                    .to_dict(orient='records'),
+                    f,
+                    indent=4,
+                )
+            print(f"Saved debug in {debug_file}")
+        return
+
+    if int(args.type) == 8:
+        metrics, debug_results = process_no_anonymous_maintained_trust_folder(
+            input_folder
+        )
+        scenario_stats.append(metrics)
+        aggregated_metrics = evaluate_predictions(scenario_stats)
+        for key in [
+            "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
+            "nis_threshold", "max_nis_prediction_gap_s",
+            "process_acceleration_std_mps2",
+            "total_messages", "cam_messages", "cpm_messages",
+        ]:
+            aggregated_metrics[key] = metrics.get(key)
+        print(aggregated_metrics['f1'])
+
+        if args.train == 0:
+            output_dir = result_directory(
+                input_folder,
+                "kalman_cam_cpm_maintained_trust_no_anonymous",
+            )
+            output_file = output_dir / "predicted.json"
+            debug_file = output_dir / "debug.json"
+            print(f"Saved in {output_file}")
+            with open(output_file, 'w') as f:
+                json.dump(aggregated_metrics, f, indent=4)
+            with open(debug_file, 'w') as f:
+                json.dump(
+                    debug_results.where(pd.notnull(debug_results), None)
+                    .to_dict(orient='records'),
+                    f,
+                    indent=4,
+                )
             print(f"Saved debug in {debug_file}")
         return
 

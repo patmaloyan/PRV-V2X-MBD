@@ -12,7 +12,7 @@ from kalman_detector import (
 
 
 EDGE_GRACE_NS = 2_000_000_000
-EDGE_TTL_NS = 8_000_000_000
+EDGE_TTL_NS = 6_000_000_000
 
 
 def valid_alias(value):
@@ -87,7 +87,9 @@ class CpmEnhancedDetector(CamCpmKalmanDetector):
             return decision(False, "reciprocity_reject", None, None, None)
         return None
 
-    def on_perceived_object_match(self, cpm, matched_track):
+    def on_perceived_object_match(
+        self, cpm, matched_track, deviation=None, perceived_object=None
+    ):
         if self.tracks_by_station_alias.get(matched_track.station_alias) is not matched_track:
             return {"edge_added": False}
 

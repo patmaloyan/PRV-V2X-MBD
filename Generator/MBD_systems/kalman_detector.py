@@ -227,7 +227,10 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
     def message_debug(self):
         return {}
 
-    def on_perceived_object_match(self, cpm: dict, matched_track: KalmanTrack):
+    def on_perceived_object_match(
+        self, cpm: dict, matched_track: KalmanTrack,
+        deviation=None, perceived_object=None,
+    ):
         return {}
 
     def perceived_object_matches(self, measurement):
@@ -312,7 +315,9 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
                 for matched_track, deviation in matched_tracks:
                     matched_track.last_accepted_time = int(cpm["rcvTime"])
                     deviations.append(deviation)
-                    edge_results.append(self.on_perceived_object_match(cpm, matched_track))
+                    edge_results.append(self.on_perceived_object_match(
+                        cpm, matched_track, deviation, perceived_object
+                    ))
                 counts["cpm_objects_matched"] += 1
                 best_deviation = min(deviations, key=lambda item: item.nis)
                 event = {
@@ -333,9 +338,15 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
                 counts["cpm_object_events"].append(event)
                 continue
 
-            self.add_anonymous_object_track(measurement)
-            counts["cpm_objects_initialized"] += 1
-            counts["cpm_object_events"].append({"object_id": object_id, "action": "initialized"})
+            if self.add_anonymous_object_track(measurement):
+                counts["cpm_objects_initialized"] += 1
+                action = "initialized"
+            else:
+                counts["cpm_objects_untracked"] += 1
+                action = "untracked"
+            counts["cpm_object_events"].append({
+                "object_id": object_id, "action": action
+            })
 
         return counts
 
@@ -360,6 +371,7 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
         # Do not expose the CPM ground-truth object_id as an observable station identity.
         track = KalmanTrack.from_cam(measurement, self.initial_covariance)
         self.tracks.append(track)
+        return True
 
 def process_kalman_folder(input_folder: Path):
     cam_dir = input_folder / "cam"
@@ -497,6 +509,7 @@ def empty_object_counts():
         "cpm_objects_observed": 0,
         "cpm_objects_matched": 0,
         "cpm_objects_initialized": 0,
+        "cpm_objects_untracked": 0,
         "cpm_objects_out_of_range": 0,
         "cpm_objects_source_rejected": 0,
         "cpm_objects_malformed": 0,

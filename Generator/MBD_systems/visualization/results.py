@@ -20,11 +20,17 @@ DETECTORS = {
     3: ("Tsukada", "kalman_cam_cpm"),
     4: ("1-Edge Recip.", "kalman_cam_cpm_enhanced"),
     5: ("2-Edge Recip.", "kalman_cam_cpm_enhanced_two_edges"),
+    6: ("Avg. Weighted Recip.", "kalman_cam_cpm_averaged_reciprocity"),
+    7: ("Maintained Trust Recip.", "kalman_cam_cpm_maintained_trust_reciprocity"),
+    8: ("Trust Recip. (No Anon.)", "kalman_cam_cpm_maintained_trust_no_anonymous"),
 }
 
 ATTACK_LABELS = {
     "randomPositionOffset": "Random Position Offset",
     "constantPositionOffset": "Constant Position Offset",
+    "randomSpeedOffset": "Random Speed Offset",
+    "constantSpeedOffset": "Constant Speed Offset",
+    "suddenStop": "Sudden Stop",
 }
 
 
@@ -35,7 +41,7 @@ def parse_args():
         help="Output filename suffix; the setting is added as a prefix",
     )
     parser.add_argument("--setting", default="urban", help="Simulation setting, such as urban or highway")
-    parser.add_argument("--types", nargs="+", type=int, default=[2, 3, 4, 5], help="Detector types (2, 3, 4, 5)")
+    parser.add_argument("--types", nargs="+", type=int, default=[2, 3, 4, 5], help="Detector types (2-8)")
     parser.add_argument(
         "--attacks",
         nargs="+",
@@ -53,7 +59,7 @@ def parse_args():
 def validate_args(args):
     unsupported = [detector_type for detector_type in args.types if detector_type not in DETECTORS]
     if unsupported:
-        raise ValueError(f"Unsupported detector types: {unsupported}; choose from 2, 3, 4, 5")
+        raise ValueError(f"Unsupported detector types: {unsupported}; choose from 2-8")
     if len(set(args.types)) != len(args.types):
         raise ValueError("Detector types must not contain duplicates")
     if len(set(args.attacks)) != len(args.attacks):
@@ -86,6 +92,40 @@ def load_metrics(setting_root, input_folder, detector_type):
 
     with metrics_path.open("r", encoding="utf-8") as file:
         metrics = json.load(file)
+
+    window_path = setting_root / "evaluation_window.json"
+    if window_path.is_file():
+        with window_path.open("r", encoding="utf-8") as file:
+            window = json.load(file)
+        debug_path = metrics_path.with_name("debug.json")
+        with debug_path.open("r", encoding="utf-8") as file:
+            decisions = json.load(file)
+        start_ns = int(float(window["start_time_s"]) * 1_000_000_000)
+        end_ns = int(float(window["end_time_s"]) * 1_000_000_000)
+        decisions = [
+            decision for decision in decisions
+            if decision.get("message_type", "CAM") == "CAM"
+            and start_ns <= int(decision["rcvTime"]) < end_ns
+        ]
+        metrics["tp"] = sum(
+            decision["attacker"] == 1 and decision["prediction"] == 1
+            for decision in decisions
+        )
+        metrics["tn"] = sum(
+            decision["attacker"] == 0 and decision["prediction"] == 0
+            for decision in decisions
+        )
+        metrics["fp"] = sum(
+            decision["attacker"] == 0 and decision["prediction"] == 1
+            for decision in decisions
+        )
+        metrics["fn"] = sum(
+            decision["attacker"] == 1 and decision["prediction"] == 0
+            for decision in decisions
+        )
+        metrics["total_messages"] = len(decisions)
+        metrics["evaluation_start_time_s"] = window["start_time_s"]
+        metrics["evaluation_end_time_s"] = window["end_time_s"]
 
     tp, tn = metrics["tp"], metrics["tn"]
     fp, fn = metrics["fp"], metrics["fn"]
@@ -150,7 +190,9 @@ def plot_results(args, results, output_path):
 
         axis.set_title(title, fontsize=13, weight="bold")
         axis.set_ylabel("Rate (%)")
-        axis.set_xticks(x_positions, detector_labels)
+        axis.set_xticks(
+            x_positions, detector_labels, rotation=15, ha="right", fontsize=9
+        )
         axis.grid(axis="y", alpha=0.25, linewidth=0.8)
         axis.set_axisbelow(True)
         axis.spines["top"].set_visible(False)
@@ -163,7 +205,11 @@ def plot_results(args, results, output_path):
             axis.set_ylim(0, 105)
 
     handles, labels = axes[0].get_legend_handles_labels()
-    figure.suptitle(f"{args.setting.title()} Detection Performance", fontsize=15, weight="bold", y=0.98)
+    setting_label = (
+        args.setting if any(character.isupper() for character in args.setting)
+        else args.setting.title()
+    )
+    figure.suptitle(f"{setting_label} Detection Performance", fontsize=15, weight="bold", y=0.98)
     figure.legend(
         handles,
         labels,

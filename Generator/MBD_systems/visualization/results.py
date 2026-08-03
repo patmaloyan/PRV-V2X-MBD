@@ -54,6 +54,11 @@ def parse_args():
         action="store_true",
         help="Add an F1 Score subplot to the generated figure",
     )
+    parser.add_argument(
+        "--no-pos-check",
+        action="store_true",
+        help="Disable only CaTCH's road-edge position plausibility check",
+    )
     return parser.parse_args()
 
 
@@ -67,19 +72,22 @@ def validate_args(args):
         raise ValueError("Attacks must not contain duplicates")
 
 
-def run_detector(input_folder, detector_type):
+def run_detector(input_folder, detector_type, no_pos_check=False):
     print(f"Running type {detector_type} on {input_folder.name}...", flush=True)
+    command = [
+        sys.executable,
+        str(MAIN_SCRIPT),
+        "--input_folder",
+        str(input_folder),
+        "--type",
+        str(detector_type),
+        "--train",
+        "0",
+    ]
+    if no_pos_check:
+        command.append("--no-pos-check")
     subprocess.run(
-        [
-            sys.executable,
-            str(MAIN_SCRIPT),
-            "--input_folder",
-            str(input_folder),
-            "--type",
-            str(detector_type),
-            "--train",
-            "0",
-        ],
+        command,
         cwd=REPO_ROOT,
         check=True,
     )
@@ -210,6 +218,8 @@ def plot_results(args, results, output_path):
         args.setting if any(character.isupper() for character in args.setting)
         else args.setting.title()
     )
+    if args.no_pos_check:
+        setting_label += " — No Road-Edge Position Check"
     figure.suptitle(f"{setting_label} Detection Performance", fontsize=15, weight="bold", y=0.98)
     figure.legend(
         handles,
@@ -256,7 +266,7 @@ def main():
             if not input_folder.is_dir():
                 raise FileNotFoundError(f"Attack input folder does not exist: {input_folder}")
             for detector_type in args.types:
-                run_detector(input_folder, detector_type)
+                run_detector(input_folder, detector_type, args.no_pos_check)
                 results[(detector_type, attack)] = load_metrics(
                     setting_root, input_folder, detector_type
                 )

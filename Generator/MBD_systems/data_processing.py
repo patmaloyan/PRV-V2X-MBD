@@ -94,9 +94,11 @@ def perform_catch_checks(messages: pd.DataFrame, checks: CatchChecks, use_alias=
                 msg.receiver.pos, msg.receiver.pos_noise,
                 msg.sender.pos, msg.sender.pos_noise,
             ),
-            'position_plausibility_check': checks.position_plausibility_check(
-                msg.sender.pos_noise, msg.sender.spd, msg.sender.spd_noise,
-                msg.sender.distance_to_road_edge,
+            'position_plausibility_check': (
+                checks.position_plausibility_check(
+                    msg.sender.pos_noise, msg.sender.spd, msg.sender.spd_noise,
+                    msg.sender.distance_to_road_edge,
+                ) if checks.params.POSITION_PLAUSIBILITY_ENABLED else 1.0
             ),
             'speed_plausibility_check': checks.speed_plausibility_check(
                 msg.sender.spd, msg.sender.spd_noise,

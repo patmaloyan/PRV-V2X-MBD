@@ -4,7 +4,15 @@ import unittest
 from pathlib import Path
 
 from data_structures import Parameters
-from kalman_detector import CamCpmKalmanDetector, CamOnlyKalmanDetector, decision
+from kalman_detector import (
+    MAX_NIS_PREDICTION_GAP_NS,
+    MAX_NIS_PREDICTION_GAP_S,
+    KNOWN_ALIAS_NIS_THRESHOLD,
+    CamCpmKalmanDetector,
+    CamOnlyKalmanDetector,
+    decision,
+    nis_prediction_is_fresh,
+)
 
 
 def message(message_type="CAM", sender_x=0.0):
@@ -17,7 +25,9 @@ def message(message_type="CAM", sender_x=0.0):
         "sender_alias": 10,
         "attacker": 0,
         "receiver": {"pos": "0,0,0"},
-        "sender": {"pos": f"{sender_x},0,0"},
+        "sender": {
+            "pos": f"{sender_x},0,0", "spd": 0.0, "hed": 0.0, "acl": 0.0,
+        },
         "perceivedObjects": [{}],
     }
 
@@ -99,6 +109,55 @@ class CatchKalmanGateTests(unittest.TestCase):
         )
         self.assertTrue(detector.within_wireless_margin(message(sender_x=60)))
         self.assertFalse(detector.within_wireless_margin(message(sender_x=151)))
+
+    def test_stale_known_alias_passes_and_resets_at_f2md_limit(self):
+        detector = CamOnlyKalmanDetector(Parameters())
+        first = message(sender_x=0.0)
+        first["rcvTime"] = 0
+        detector.add_track(first)
+        track = detector.tracks[0]
+
+        current = message(sender_x=25.0)
+        current["rcvTime"] = MAX_NIS_PREDICTION_GAP_NS
+        result = detector.known_station_alias_check(current, [])
+
+        self.assertEqual(MAX_NIS_PREDICTION_GAP_S, 3.1)
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["reason"], "known_alias_stale_reset_accept")
+        self.assertEqual(track.last_update_time, current["rcvTime"])
+        self.assertEqual(track.filter.x[0], 25.0)
+
+    def test_stale_track_is_not_used_for_pseudonym_matching(self):
+        detector = CamOnlyKalmanDetector(Parameters())
+        first = message(sender_x=0.0)
+        first["rcvTime"] = 0
+        detector.add_track(first)
+        track = detector.tracks[0]
+
+        changed = message(sender_x=0.0)
+        changed["sender_alias"] = 11
+        changed["rcvTime"] = MAX_NIS_PREDICTION_GAP_NS
+
+        self.assertFalse(nis_prediction_is_fresh(track, changed["rcvTime"]))
+        self.assertIsNone(detector.pseudonym_change_check(changed))
+
+    def test_known_alias_uses_separate_permissive_threshold(self):
+        detector = CamOnlyKalmanDetector(Parameters())
+        first = message(sender_x=0.0)
+        detector.add_track(first)
+
+        current = message(sender_x=25.0)
+        current["rcvTime"] = 2
+        result = detector.known_station_alias_check(current, [])
+
+        self.assertEqual(KNOWN_ALIAS_NIS_THRESHOLD, 100.0)
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["reason"], "known_alias_accept")
+
+        detector = CamOnlyKalmanDetector(Parameters())
+        detector.add_track(first)
+        current["sender_alias"] = 11
+        self.assertIsNone(detector.pseudonym_change_check(current))
 
 
 if __name__ == "__main__":

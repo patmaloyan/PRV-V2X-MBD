@@ -10,17 +10,18 @@ from data_processing import calculate_metrics, load_catch_messages, perform_catc
 
 
 class StubChecks:
-    def __init__(self, range_factor=1.0, intersection_factor=1.0):
+    def __init__(self, range_factor=1.0, intersection_factor=1.0, position_factor=1.0):
         self.params = load_catch_profile("urban-low")
         self.range_factor = range_factor
         self.intersection_factor = intersection_factor
+        self.position_factor = position_factor
         self.intersection_calls = 0
 
     def range_plausibility_check(self, *args):
         return self.range_factor
 
     def position_plausibility_check(self, *args):
-        return 1.0
+        return self.position_factor
 
     def speed_plausibility_check(self, *args):
         return 1.0
@@ -90,6 +91,17 @@ class CatchProfileTests(unittest.TestCase):
 
 
 class CatchIdentityTests(unittest.TestCase):
+    def test_no_pos_check_disables_only_road_edge_check(self):
+        checks = StubChecks(position_factor=0.0)
+        checks.params.POSITION_PLAUSIBILITY_ENABLED = False
+        result = perform_catch_checks(
+            pd.DataFrame([message("veh_1", 10, 0)]), checks, use_alias=True
+        )
+
+        self.assertEqual(result.iloc[0]["check_position_plausibility_check"], 1.0)
+        self.assertEqual(result.iloc[0]["check_range_plausibility"], 1.0)
+        self.assertEqual(result.iloc[0]["prediction"], 0)
+
     def test_type_zero_keeps_history_across_alias_change(self):
         rows = [message("veh_1", 10, 0), message("veh_1", 20, 1)]
         result = perform_catch_checks(pd.DataFrame(rows), StubChecks())

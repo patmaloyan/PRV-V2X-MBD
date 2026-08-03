@@ -152,3 +152,11 @@ class KalmanTrack:
         self.filter.update(measurement)
         self.last_acceleration = acceleration_from_cam(cam)
         self.station_alias = int(cam.get("sender_alias", self.station_alias))
+
+    def reset_from_cam(self, cam: dict, initial_covariance: np.ndarray):
+        fresh = self.from_cam(cam, initial_covariance)
+        self.filter = fresh.filter
+        self.last_acceleration = fresh.last_acceleration
+        self.last_update_time = fresh.last_update_time
+        self.last_accepted_time = fresh.last_accepted_time
+        self.station_alias = fresh.station_alias

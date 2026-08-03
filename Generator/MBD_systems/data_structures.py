@@ -47,6 +47,8 @@ class Message:
 
 @dataclass
 class Parameters:
+    POSITION_PLAUSIBILITY_ENABLED: bool = True
+
     # RANGE & DISTANCE PARAMETER
     MAX_PLAUSIBLE_RANGE: float = 418.13997683369433  # mpr
     MAX_SA_RANGE: float = 150.0  # msar

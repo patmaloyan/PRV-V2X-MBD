@@ -95,6 +95,9 @@ def add_catch_output(aggregated_metrics, metrics, profile, params):
     aggregated_metrics["catch_check_activations"] = metrics["catch_check_activations"]
     aggregated_metrics["kalman_skipped"] = metrics["kalman_skipped"]
     aggregated_metrics["parameters"] = vars(params)
+    aggregated_metrics["position_plausibility_check_enabled"] = (
+        params.POSITION_PLAUSIBILITY_ENABLED
+    )
 
 
 def result_directory(input_folder: Path, detection_type: str):
@@ -118,6 +121,11 @@ def main():
         "--catch-profile",
         choices=["urban-low", "urban-high", "highway-low", "highway-high"],
         default="urban-low",
+    )
+    parser.add_argument(
+        "--no-pos-check",
+        action="store_true",
+        help="Disable only CaTCH's road-edge position plausibility check",
     )
     parser.add_argument("--train", type=float)
     parser.add_argument("--parameter", required=False,default=None)
@@ -185,6 +193,8 @@ def main():
     else:
         params = Parameters()
 
+    params.POSITION_PLAUSIBILITY_ENABLED = not args.no_pos_check
+
     params_dict = vars(params)
     count = 0
     max_workers = args.workers
@@ -197,6 +207,7 @@ def main():
         for key in [
             "wireless_range_m", "range_margin_m", "nis_threshold",
             "max_nis_prediction_gap_s", "process_acceleration_std_mps2",
+            "known_alias_nis_threshold",
             "total_messages",
         ]:
             aggregated_metrics[key] = metrics.get(key)
@@ -223,7 +234,7 @@ def main():
         aggregated_metrics = evaluate_predictions(scenario_stats)
         for key in [
             "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
-            "nis_threshold", "max_nis_prediction_gap_s",
+            "nis_threshold", "known_alias_nis_threshold", "max_nis_prediction_gap_s",
             "process_acceleration_std_mps2",
             "total_messages", "cam_messages", "cpm_messages",
         ]:
@@ -251,7 +262,7 @@ def main():
         aggregated_metrics = evaluate_predictions(scenario_stats)
         for key in [
             "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
-            "nis_threshold", "max_nis_prediction_gap_s",
+            "nis_threshold", "known_alias_nis_threshold", "max_nis_prediction_gap_s",
             "process_acceleration_std_mps2",
             "total_messages", "cam_messages", "cpm_messages",
         ]:
@@ -279,7 +290,7 @@ def main():
         aggregated_metrics = evaluate_predictions(scenario_stats)
         for key in [
             "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
-            "nis_threshold", "max_nis_prediction_gap_s",
+            "nis_threshold", "known_alias_nis_threshold", "max_nis_prediction_gap_s",
             "process_acceleration_std_mps2",
             "total_messages", "cam_messages", "cpm_messages",
         ]:
@@ -305,7 +316,7 @@ def main():
         aggregated_metrics = evaluate_predictions(scenario_stats)
         for key in [
             "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
-            "nis_threshold", "max_nis_prediction_gap_s",
+            "nis_threshold", "known_alias_nis_threshold", "max_nis_prediction_gap_s",
             "process_acceleration_std_mps2",
             "total_messages", "cam_messages", "cpm_messages",
         ]:
@@ -340,7 +351,7 @@ def main():
         aggregated_metrics = evaluate_predictions(scenario_stats)
         for key in [
             "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
-            "nis_threshold", "max_nis_prediction_gap_s",
+            "nis_threshold", "known_alias_nis_threshold", "max_nis_prediction_gap_s",
             "process_acceleration_std_mps2",
             "total_messages", "cam_messages", "cpm_messages",
         ]:
@@ -375,7 +386,7 @@ def main():
         aggregated_metrics = evaluate_predictions(scenario_stats)
         for key in [
             "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
-            "nis_threshold", "max_nis_prediction_gap_s",
+            "nis_threshold", "known_alias_nis_threshold", "max_nis_prediction_gap_s",
             "process_acceleration_std_mps2",
             "total_messages", "cam_messages", "cpm_messages",
         ]:
@@ -520,6 +531,9 @@ def main():
                 for name in sorted(activation_names)
             }
             aggregated_metrics["parameters"] = params_dict
+            aggregated_metrics["position_plausibility_check_enabled"] = (
+                params.POSITION_PLAUSIBILITY_ENABLED
+            )
         output_dir = result_directory(input_folder, detection_type)
         output_file = output_dir / "predicted.json"
         print(f"Saved in {output_file}")

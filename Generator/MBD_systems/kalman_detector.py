@@ -22,8 +22,10 @@ EGO_OBJECT_POSITION_THRESHOLD_M = 10
 EGO_OBJECT_SPEED_THRESHOLD_MPS = 5
 # 99% chi-square threshold for the four measured values [x, y, vx, vy].
 NIS_THRESHOLD = 13.28
-# Do not authenticate against a Kalman prediction whose covariance has grown stale.
-MAX_NIS_PREDICTION_GAP_S = 2.0
+# Known aliases have already passed CaTCH and do not require conservative reassociation.
+KNOWN_ALIAS_NIS_THRESHOLD = 100.0
+# F2MD resets a Kalman filter when its last update is this old.
+MAX_NIS_PREDICTION_GAP_S = 3.1
 MAX_NIS_PREDICTION_GAP_NS = int(MAX_NIS_PREDICTION_GAP_S * 1_000_000_000)
 RANGE_MARGIN_M = 50.0
 EGO_LOOKBACK_NS = 2_000_000_000
@@ -111,20 +113,13 @@ class CamOnlyKalmanDetector:
 
         deviation = track.deviation_against_cam(cam, self.measurement_noise)
         if not nis_prediction_is_fresh(track, int(cam["rcvTime"])):
-            ego_match = self.find_ego_sensor_match(cam, ego_snapshots)
-            if ego_match is not None:
-                track.update_from_cam(cam, self.measurement_noise)
-                return decision(
-                    True, "known_alias_stale_ego_accept",
-                    ego_match["pos_error"], ego_match["speed_error"],
-                    track.station_alias, deviation.nis,
-                )
+            track.reset_from_cam(cam, self.initial_covariance)
             return decision(
-                False, "known_alias_stale_reject", deviation.position_error,
+                True, "known_alias_stale_reset_accept", deviation.position_error,
                 deviation.speed_error, track.station_alias, deviation.nis,
             )
 
-        if nis_within_threshold(deviation.nis):
+        if nis_within_threshold(deviation.nis, KNOWN_ALIAS_NIS_THRESHOLD):
             track.update_from_cam(cam, self.measurement_noise)
             return decision(
                 True, "known_alias_accept", deviation.position_error,
@@ -420,6 +415,7 @@ def process_kalman_folder(input_folder: Path, catch_params: Parameters):
     metrics["wireless_range_m"] = catch_params.MAX_PLAUSIBLE_RANGE
     metrics["range_margin_m"] = RANGE_MARGIN_M
     metrics["nis_threshold"] = NIS_THRESHOLD
+    metrics["known_alias_nis_threshold"] = KNOWN_ALIAS_NIS_THRESHOLD
     metrics["max_nis_prediction_gap_s"] = MAX_NIS_PREDICTION_GAP_S
     metrics["process_acceleration_std_mps2"] = PROCESS_ACCELERATION_STD_MPS2
     metrics["total_messages"] = int(len(results))
@@ -461,6 +457,7 @@ def process_cam_cpm_kalman_folder(
     metrics["range_margin_m"] = RANGE_MARGIN_M
     metrics["cpm_sensor_range_m"] = CPM_SENSOR_RANGE_M
     metrics["nis_threshold"] = NIS_THRESHOLD
+    metrics["known_alias_nis_threshold"] = KNOWN_ALIAS_NIS_THRESHOLD
     metrics["max_nis_prediction_gap_s"] = MAX_NIS_PREDICTION_GAP_S
     metrics["process_acceleration_std_mps2"] = PROCESS_ACCELERATION_STD_MPS2
     metrics["total_messages"] = int(len(evaluated_results))
@@ -607,13 +604,13 @@ def latest_ego_snapshot(ego_snapshots: list[dict], rcv_time: int):
     return latest
 
 
-def nis_within_threshold(nis):
-    return nis <= NIS_THRESHOLD
+def nis_within_threshold(nis, threshold=NIS_THRESHOLD):
+    return nis <= threshold
 
 
 def nis_prediction_is_fresh(track, time_ns):
     # last_update_time is the timestamp underlying the predicted state/covariance.
-    return int(time_ns) - track.last_update_time <= MAX_NIS_PREDICTION_GAP_NS
+    return int(time_ns) - track.last_update_time < MAX_NIS_PREDICTION_GAP_NS
 
 
 def ego_errors_within_threshold(pos_error, speed_error):

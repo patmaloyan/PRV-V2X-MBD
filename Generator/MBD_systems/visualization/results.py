@@ -16,13 +16,14 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 MAIN_SCRIPT = REPO_ROOT / "Generator" / "MBD_systems" / "main.py"
 
 DETECTORS = {
+    100: ("CaTCH", "catch_alias"),
     2: ("CAM Only", "kalman_cam_only"),
     3: ("Tsukada", "kalman_cam_cpm"),
     4: ("1-Edge Recip.", "kalman_cam_cpm_enhanced"),
     5: ("2-Edge Recip.", "kalman_cam_cpm_enhanced_two_edges"),
     6: ("Avg. Weighted Recip.", "kalman_cam_cpm_averaged_reciprocity"),
     7: ("Maintained Trust Recip.", "kalman_cam_cpm_maintained_trust_reciprocity"),
-    8: ("Trust Recip. (No Anon.)", "kalman_cam_cpm_maintained_trust_no_anonymous"),
+    20: ("Trust Recip. (No Anon.)", "kalman_cam_cpm_maintained_trust_no_anonymous"),
 }
 
 ATTACK_LABELS = {
@@ -41,7 +42,7 @@ def parse_args():
         help="Output filename suffix; the setting is added as a prefix",
     )
     parser.add_argument("--setting", default="urban", help="Simulation setting, such as urban or highway")
-    parser.add_argument("--types", nargs="+", type=int, default=[2, 3, 4, 5], help="Detector types (2-8)")
+    parser.add_argument("--types", nargs="+", type=int, default=[2, 3, 4, 5], help="Detector types (2-7, 20, 100)")
     parser.add_argument(
         "--attacks",
         nargs="+",
@@ -59,7 +60,7 @@ def parse_args():
 def validate_args(args):
     unsupported = [detector_type for detector_type in args.types if detector_type not in DETECTORS]
     if unsupported:
-        raise ValueError(f"Unsupported detector types: {unsupported}; choose from 2-8")
+        raise ValueError(f"Unsupported detector types: {unsupported}; choose from 2-7, 20, or 100")
     if len(set(args.types)) != len(args.types):
         raise ValueError("Detector types must not contain duplicates")
     if len(set(args.attacks)) != len(args.attacks):

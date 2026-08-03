@@ -9,6 +9,7 @@ from typing import Dict, Any
 import pandas as pd
 
 from data_structures import Parameters
+from catch_profiles import load_catch_profile
 from cpm_enhanced_detector import process_cpm_enhanced_folder
 from kalman_detector import process_cam_cpm_kalman_folder, process_kalman_folder
 from weighted_reciprocity_detector import (
@@ -26,6 +27,19 @@ def worker_process_json(input_file: str, option: int, params_dict: Dict[str, Any
         input_path = Path(input_file)
         params = Parameters(**params_dict)
         result = data_processing.process(input_path, option, params, pd.DataFrame(), source_file)
+        return {'status': 'ok', 'metrics': result, 'source': source_file}
+    except Exception as e:
+        return {'status': 'error', 'error': str(e), 'source': source_file}
+
+
+def worker_process_catch_pair(cam_file, cpm_file, option, params_dict, source_file):
+    try:
+        import data_processing
+
+        params = Parameters(**params_dict)
+        df = data_processing.load_catch_messages(cam_file, cpm_file)
+        input_path = Path(cam_file or cpm_file)
+        result = data_processing.process(input_path, option, params, df, source_file)
         return {'status': 'ok', 'metrics': result, 'source': source_file}
     except Exception as e:
         return {'status': 'error', 'error': str(e), 'source': source_file}
@@ -75,6 +89,14 @@ def evaluate_predictions(scenario_stats):
     return aggregated_metrics
 
 
+def add_catch_output(aggregated_metrics, metrics, profile, params):
+    aggregated_metrics["catch_profile"] = profile
+    aggregated_metrics["catch_metrics"] = metrics["catch_metrics"]
+    aggregated_metrics["catch_check_activations"] = metrics["catch_check_activations"]
+    aggregated_metrics["kalman_skipped"] = metrics["kalman_skipped"]
+    aggregated_metrics["parameters"] = vars(params)
+
+
 def result_directory(input_folder: Path, detection_type: str):
     """Store results as results/<attack_type>/<detection_type>/."""
     output_dir = input_folder.parent / "results" / input_folder.name / detection_type
@@ -88,9 +110,14 @@ def main():
     parser.add_argument(
         "--type",
         type=int,
-        choices=range(9),
-        help="0 = catch-checks, 1 = legacy checks, 2 = CAM-only Kalman, 3 = CAM+CPM Kalman, 4 = reciprocal CPM Kalman, 5 = two-edge reciprocal CPM Kalman, 6 = three-score average reciprocity, 7 = maintained-trust reciprocity, 8 = maintained trust without anonymous CPM tracks",
+        choices=[*range(8), 20, 100],
+        help="0 = catch-checks, 1 = legacy checks, 2 = CAM-only Kalman, 3 = CAM+CPM Kalman, 4 = reciprocal CPM Kalman, 5 = two-edge reciprocal CPM Kalman, 6 = three-score average reciprocity, 7 = maintained-trust reciprocity, 20 = maintained trust without anonymous CPM tracks, 100 = alias-aware catch",
         required=True,
+    )
+    parser.add_argument(
+        "--catch-profile",
+        choices=["urban-low", "urban-high", "highway-low", "highway-high"],
+        default="urban-low",
     )
     parser.add_argument("--train", type=float)
     parser.add_argument("--parameter", required=False,default=None)
@@ -116,7 +143,9 @@ def main():
     scenario_stats = []
 
     # Parameter Setup
-    if args.train == 1:
+    if int(args.type) in (0, 2, 3, 4, 5, 6, 7, 20, 100) and args.train != 1:
+        params = load_catch_profile(args.catch_profile)
+    elif args.train == 1:
         params = Parameters(MAX_PLAUSIBLE_RANGE=args.mpr,
                             MAX_SA_RANGE=args.msar,
                             MAX_PLAUSIBLE_DIST_NEGATIVE=args.mpdn,
@@ -162,7 +191,7 @@ def main():
 
     # *** Added Section for Kalman procedure, each type of evalutation ***
     if int(args.type) == 2:
-        metrics, debug_results = process_kalman_folder(input_folder)
+        metrics, debug_results = process_kalman_folder(input_folder, params)
         scenario_stats.append(metrics)
         aggregated_metrics = evaluate_predictions(scenario_stats)
         for key in [
@@ -171,6 +200,7 @@ def main():
             "total_messages",
         ]:
             aggregated_metrics[key] = metrics.get(key)
+        add_catch_output(aggregated_metrics, metrics, args.catch_profile, params)
         print(aggregated_metrics['f1'])
 
         if args.train == 0:
@@ -188,7 +218,7 @@ def main():
 
     if int(args.type) == 3:
         # Type 3 adds the CPM perceived-object branch while preserving type 2 as CAM-only.
-        metrics, debug_results = process_cam_cpm_kalman_folder(input_folder)
+        metrics, debug_results = process_cam_cpm_kalman_folder(input_folder, params)
         scenario_stats.append(metrics)
         aggregated_metrics = evaluate_predictions(scenario_stats)
         for key in [
@@ -198,6 +228,7 @@ def main():
             "total_messages", "cam_messages", "cpm_messages",
         ]:
             aggregated_metrics[key] = metrics.get(key)
+        add_catch_output(aggregated_metrics, metrics, args.catch_profile, params)
         print(aggregated_metrics['f1'])
 
         if args.train == 0:
@@ -214,7 +245,7 @@ def main():
 
     if int(args.type) == 4:
         metrics, debug_results = process_cpm_enhanced_folder(
-            input_folder, required_unreciprocated_edges=1
+            input_folder, params, required_unreciprocated_edges=1
         )
         scenario_stats.append(metrics)
         aggregated_metrics = evaluate_predictions(scenario_stats)
@@ -225,6 +256,7 @@ def main():
             "total_messages", "cam_messages", "cpm_messages",
         ]:
             aggregated_metrics[key] = metrics.get(key)
+        add_catch_output(aggregated_metrics, metrics, args.catch_profile, params)
         print(aggregated_metrics['f1'])
 
         if args.train == 0:
@@ -241,7 +273,7 @@ def main():
 
     if int(args.type) == 5:
         metrics, debug_results = process_cpm_enhanced_folder(
-            input_folder, required_unreciprocated_edges=2
+            input_folder, params, required_unreciprocated_edges=2
         )
         scenario_stats.append(metrics)
         aggregated_metrics = evaluate_predictions(scenario_stats)
@@ -252,6 +284,7 @@ def main():
             "total_messages", "cam_messages", "cpm_messages",
         ]:
             aggregated_metrics[key] = metrics.get(key)
+        add_catch_output(aggregated_metrics, metrics, args.catch_profile, params)
         print(aggregated_metrics['f1'])
 
         if args.train == 0:
@@ -267,7 +300,7 @@ def main():
         return
 
     if int(args.type) == 6:
-        metrics, debug_results = process_weighted_reciprocity_folder(input_folder)
+        metrics, debug_results = process_weighted_reciprocity_folder(input_folder, params)
         scenario_stats.append(metrics)
         aggregated_metrics = evaluate_predictions(scenario_stats)
         for key in [
@@ -277,6 +310,7 @@ def main():
             "total_messages", "cam_messages", "cpm_messages",
         ]:
             aggregated_metrics[key] = metrics.get(key)
+        add_catch_output(aggregated_metrics, metrics, args.catch_profile, params)
         print(aggregated_metrics['f1'])
 
         if args.train == 0:
@@ -300,7 +334,7 @@ def main():
 
     if int(args.type) == 7:
         metrics, debug_results = process_maintained_trust_reciprocity_folder(
-            input_folder
+            input_folder, params
         )
         scenario_stats.append(metrics)
         aggregated_metrics = evaluate_predictions(scenario_stats)
@@ -311,6 +345,7 @@ def main():
             "total_messages", "cam_messages", "cpm_messages",
         ]:
             aggregated_metrics[key] = metrics.get(key)
+        add_catch_output(aggregated_metrics, metrics, args.catch_profile, params)
         print(aggregated_metrics['f1'])
 
         if args.train == 0:
@@ -332,9 +367,9 @@ def main():
             print(f"Saved debug in {debug_file}")
         return
 
-    if int(args.type) == 8:
+    if int(args.type) == 20:
         metrics, debug_results = process_no_anonymous_maintained_trust_folder(
-            input_folder
+            input_folder, params
         )
         scenario_stats.append(metrics)
         aggregated_metrics = evaluate_predictions(scenario_stats)
@@ -345,6 +380,7 @@ def main():
             "total_messages", "cam_messages", "cpm_messages",
         ]:
             aggregated_metrics[key] = metrics.get(key)
+        add_catch_output(aggregated_metrics, metrics, args.catch_profile, params)
         print(aggregated_metrics['f1'])
 
         if args.train == 0:
@@ -369,11 +405,34 @@ def main():
 
     print(f"Starting processing with {max_workers} workers...", file=sys.stderr)
 
+    nested_catch = (
+        int(args.type) in (0, 100)
+        and (input_folder / "cam").is_dir()
+        and (input_folder / "cpm").is_dir()
+    )
+    data_folder = input_folder
+
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {}
-        parquet_files = list(input_folder.glob('*.parquet'))
+        if nested_catch:
+            cam_files = {path.stem: path for path in (input_folder / "cam").glob("*.json")}
+            cpm_files = {path.stem: path for path in (input_folder / "cpm").glob("*.json")}
+            receiver_ids = sorted(set(cam_files) | set(cpm_files))
+            total_files = len(receiver_ids)
+            for receiver_id in receiver_ids:
+                f = executor.submit(
+                    worker_process_catch_pair,
+                    str(cam_files[receiver_id]) if receiver_id in cam_files else None,
+                    str(cpm_files[receiver_id]) if receiver_id in cpm_files else None,
+                    int(args.type), params_dict, receiver_id,
+                )
+                futures[f] = receiver_id
 
-        if parquet_files:
+        parquet_files = list(data_folder.glob('*.parquet'))
+
+        if nested_catch:
+            pass
+        elif parquet_files:
             # Parquet Verarbeitung
             parquet_file = parquet_files[0]
             df_all = pd.read_parquet(parquet_file)
@@ -393,7 +452,7 @@ def main():
                 futures[f] = source_name
         else:
             # JSON Verarbeitung
-            json_files = [f for f in input_folder.glob('*.json')
+            json_files = [f for f in data_folder.glob('*.json')
                           if "ground_truth" not in f.name.lower()]
             total_files = len(json_files)
 
@@ -402,6 +461,9 @@ def main():
                 f = executor.submit(worker_process_json, str(json_file),
                                     int(args.type), params_dict, source_name)
                 futures[f] = source_name
+
+        if total_files == 0:
+            raise ValueError(f"No input files found in {data_folder}")
 
         # Ergebnisse sammeln
         for future in as_completed(futures):
@@ -424,12 +486,49 @@ def main():
     print(aggregated_metrics['f1'])
 
     if args.train == 0:
-        detection_type = "catch" if int(args.type) == 0 else "legacy"
+        detection_type = {
+            0: "catch",
+            100: "catch_alias",
+        }.get(int(args.type), "legacy")
+        if int(args.type) in (0, 100):
+            aggregated_metrics["catch_profile"] = args.catch_profile
+            aggregated_metrics["identity"] = (
+                "sender_id" if int(args.type) == 0 else "sender_alias"
+            )
+            aggregated_metrics["alias_grace_messages"] = sum(
+                result.get("alias_grace_messages", 0) for result in scenario_stats
+            )
+            aggregated_metrics["total_messages"] = sum(
+                result.get("total_messages", 0) for result in scenario_stats
+            )
+            aggregated_metrics["cam_messages"] = sum(
+                result.get("cam_messages", 0) for result in scenario_stats
+            )
+            aggregated_metrics["cpm_messages"] = sum(
+                result.get("cpm_messages", 0) for result in scenario_stats
+            )
+            activation_names = {
+                name
+                for result in scenario_stats
+                for name in result.get("check_activations", {})
+            }
+            aggregated_metrics["check_activations"] = {
+                name: sum(
+                    result.get("check_activations", {}).get(name, 0)
+                    for result in scenario_stats
+                )
+                for name in sorted(activation_names)
+            }
+            aggregated_metrics["parameters"] = params_dict
         output_dir = result_directory(input_folder, detection_type)
         output_file = output_dir / "predicted.json"
         print(f"Saved in {output_file}")
         with open(output_file, 'w') as f:
             json.dump(aggregated_metrics, f, indent=4)
+        if int(args.type) in (0, 100):
+            debug_file = output_dir / "debug.json"
+            with open(debug_file, 'w') as f:
+                json.dump(scenario_stats, f, indent=4)
 
 
 if __name__ == "__main__":

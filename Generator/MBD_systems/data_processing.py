@@ -34,127 +34,167 @@ def calculate_metrics(results: pd.DataFrame) -> dict:
 
     fn = ((results['attacker'] == 1) & (results['prediction'] == 0)).sum()
 
-    return {
+    metrics = {
         'tp': int(tp),
         'tn': int(tn),
         'fp': int(fp),
-        'fn': int(fn)
+        'fn': int(fn),
+        'total_messages': int(len(results)),
     }
+    metrics['alias_grace_messages'] = int(
+        results.get('catch_alias_grace', pd.Series(dtype=bool)).sum()
+    )
+    message_types = results.get('message_type', pd.Series(dtype=str))
+    metrics['cam_messages'] = int((message_types == 'CAM').sum())
+    metrics['cpm_messages'] = int((message_types == 'CPM').sum())
+    metrics['check_activations'] = {
+        column.removeprefix('check_'): int((results[column] < 0.5).sum())
+        for column in results.columns if column.startswith('check_')
+    }
+    return metrics
 
 
-def perform_catch_checks(messages: pd.DataFrame, checks: CatchChecks) -> pd.DataFrame:
-    history = dict()
-    history_data = dict()
+def load_catch_messages(cam_path=None, cpm_path=None):
+    records = []
+    for message_type, path in (("CAM", cam_path), ("CPM", cpm_path)):
+        if path is None:
+            continue
+        with Path(path).open("r", encoding="utf-8") as file:
+            for message in json.load(file):
+                record = dict(message)
+                record["message_type"] = message_type
+                records.append(record)
+    frame = pd.json_normalize(records, sep='_')
+    if frame.empty:
+        return frame
+    return frame.sort_values(
+        ['rcvTime', 'sendTime', 'messageID', 'message_type'],
+        kind='mergesort', ignore_index=True,
+    )
 
-    def process_row(df_msg: pd.Series):
-        msg = Mapper.row_to_message(df_msg)
-        prediction_results = dict()
-        activations = dict()
-        result = dict()
 
-        prediction_results['range_plausibility'] = checks.range_plausibility_check(
-            msg.receiver.pos, msg.receiver.pos_noise, msg.sender.pos, msg.sender.pos_noise)
+def perform_catch_checks(messages: pd.DataFrame, checks: CatchChecks, use_alias=False) -> pd.DataFrame:
+    histories = {}
+    latest_messages = {}
+    first_seen = {}
+    results = []
 
-        if prediction_results['range_plausibility'] < 0.5:
-            activations['range_plausibility'] = True
+    for _, row in messages.iterrows():
+        msg = Mapper.row_to_message(row)
+        message_type = row.get('message_type', 'CAM')
+        identity = msg.sender_alias if use_alias else msg.sender_id
+        history_key = (message_type, identity)
+        first_seen.setdefault(history_key, msg.rcvTime)
+        alias_age = MDMLib.ns_to_seconds(msg.rcvTime - first_seen[history_key])
+        grace = use_alias and alias_age < checks.params.MAX_DELTA_INTERSECTION
+        skipped = []
 
-        prediction_results['position_plausibility_check'] = checks.position_plausibility_check(
-            msg.sender.pos_noise, msg.sender.spd, msg.sender.spd_noise, msg.sender.distance_to_road_edge)
+        factors = {
+            'range_plausibility': checks.range_plausibility_check(
+                msg.receiver.pos, msg.receiver.pos_noise,
+                msg.sender.pos, msg.sender.pos_noise,
+            ),
+            'position_plausibility_check': checks.position_plausibility_check(
+                msg.sender.pos_noise, msg.sender.spd, msg.sender.spd_noise,
+                msg.sender.distance_to_road_edge,
+            ),
+            'speed_plausibility_check': checks.speed_plausibility_check(
+                msg.sender.spd, msg.sender.spd_noise,
+            ),
+        }
 
-        if prediction_results['position_plausibility_check'] < 0.5:
-            activations['position_plausibility_check'] = True
+        prior_messages = histories.get(history_key, [])
+        earlier_messages = [item for item in prior_messages if item.sendTime < msg.sendTime]
+        previous = max(earlier_messages, key=lambda item: item.sendTime, default=None)
+        if previous is None:
+            skipped.extend([
+                'position_consistency_check',
+                'speed_consistency_check',
+                'position_speed_consistency_check',
+                'position_heading_consistency_check',
+            ])
+        else:
+            delta_time = MDMLib.ns_to_seconds(msg.sendTime - previous.sendTime)
+            factors['position_consistency_check'] = checks.position_consistency_check(
+                msg.sender.pos, msg.sender.pos_noise,
+                previous.sender.pos, previous.sender.pos_noise, delta_time,
+            )
+            factors['speed_consistency_check'] = checks.speed_consistency_check(
+                msg.sender.spd, msg.sender.spd_noise,
+                previous.sender.spd, previous.sender.spd_noise, delta_time,
+            )
+            factors['position_speed_consistency_check'] = checks.position_speed_consistency_check(
+                msg.sender.pos, msg.sender.pos_noise,
+                previous.sender.pos, previous.sender.pos_noise,
+                msg.sender.spd, msg.sender.spd_noise,
+                previous.sender.spd, previous.sender.spd_noise, delta_time,
+            )
+            factors['position_heading_consistency_check'] = checks.position_heading_consistency_check(
+                msg.sender.hed, msg.sender.hed_noise,
+                previous.sender.pos, previous.sender.pos_noise,
+                msg.sender.pos, msg.sender.pos_noise, delta_time,
+                msg.sender.spd, msg.sender.spd_noise,
+            )
 
-        prediction_results['speed_plausibility_check'] = checks.speed_plausibility_check(
-            msg.sender.spd, msg.sender.spd_noise)
+        if grace:
+            skipped.append('intersection_check')
+        else:
+            intersection_factors = []
+            for (other_type, other_identity), other in latest_messages.items():
+                time_delta = MDMLib.ns_to_seconds(msg.rcvTime - other.rcvTime)
+                if (other_type != message_type or other_identity == identity
+                        or not 0 <= time_delta <= checks.params.MAX_DELTA_INTERSECTION):
+                    continue
+                intersection_factors.append(checks.intersection_check(
+                    msg.sender.pos, msg.sender.pos_noise,
+                    other.sender.pos, other.sender.pos_noise,
+                    msg.sender.hed, other.sender.hed,
+                    Coord(5, 1.8, 1.5),
+                    MDMLib.ns_to_seconds(msg.sendTime - other.sendTime),
+                ))
+            factors['intersection_check'] = min(intersection_factors, default=1.0)
 
-        if prediction_results['speed_plausibility_check'] < 0.5:
-            activations['speed_plausibility_check'] = True
+        result = {
+            'prediction': int(any(value < 0.5 for value in factors.values())),
+            'catch_identity': str(identity),
+            'catch_alias_grace': grace,
+            'catch_skipped_checks': skipped,
+        }
+        result.update({f'check_{name}': value for name, value in factors.items()})
+        results.append(result)
 
-        #if (msg.sender_id not in history.keys() or MDMLib.ns_to_seconds(
-         #       msg.rcvTime - history[msg.sender_id]) > Parameters.MAX_SA_TIME):
-          #  prediction_results['sudden_appearance_check'] = checks.sudden_appearance_check(
-           #     msg.receiver.pos, msg.receiver.pos_noise, msg.sender.pos, msg.sender.pos_noise)
+        histories.setdefault(history_key, []).append(msg)
+        latest_messages[history_key] = msg
 
-            #if prediction_results['sudden_appearance_check'] < 0.5:
-             #   activations['sudden_appearance_check'] = True
-
-        #history[msg.sender_id] = msg.rcvTime
-
-        sender_history = messages[
-            (messages['sender_id'] == msg.sender_id) &
-            (messages['sendTime'] < msg.sendTime)
-            ].sort_values('sendTime', ascending=False)
-
-        prev_msg = Mapper.row_to_message(sender_history.iloc[0]) if not sender_history.empty else None
-
-        if prev_msg is not None:
-            delta_time = MDMLib.ns_to_seconds(msg.sendTime - prev_msg.sendTime)
-
-            prediction_results['position_consistency_check'] = checks.position_consistency_check(
-                msg.sender.pos, msg.sender.pos_noise, prev_msg.sender.pos, prev_msg.sender.pos_noise, delta_time)
-
-            if prediction_results['position_consistency_check'] < 0.5:
-                activations['position_consistency_check'] = True
-
-            prediction_results['speed_consistency_check'] = checks.speed_consistency_check(
-                msg.sender.spd, msg.sender.spd_noise, prev_msg.sender.spd, prev_msg.sender.spd_noise, delta_time)
-
-            if prediction_results['speed_consistency_check'] < 0.5:
-                activations['speed_consistency_check'] = True
-
-            prediction_results['position_speed_consistency_check'] = checks.position_speed_consistency_check(
-                msg.sender.pos, msg.sender.pos_noise, prev_msg.sender.pos, prev_msg.sender.pos_noise, msg.sender.spd,
-                msg.sender.spd_noise, prev_msg.sender.spd, prev_msg.sender.spd_noise, delta_time)
-
-            if prediction_results['position_speed_consistency_check'] < 0.5:
-                activations['position_speed_consistency_check'] = True
-
-            prediction_results['position_heading_consistency_check'] = checks.position_heading_consistency_check(
-                msg.sender.hed, msg.sender.hed_noise, prev_msg.sender.pos, prev_msg.sender.pos_noise, msg.sender.pos,
-                msg.sender.pos_noise, delta_time, msg.sender.spd, msg.sender.spd_noise)
-
-            if prediction_results['position_heading_consistency_check'] < 0.5:
-                activations['position_heading_consistency_check'] = True
-
-        prediction_results['intersection_check'] = 0
-        for sender_id, hist_data in history_data.items():
-            if len(hist_data) > 0:
-                data = hist_data[-1]
-
-                if (MDMLib.ns_to_seconds(msg.rcvTime - data.rcvTime) <= checks.params.MAX_DELTA_INTERSECTION and
-                        data.sender_id != msg.sender_id):
-
-                    delta_time = MDMLib.ns_to_seconds(msg.sendTime - data.sendTime)
-
-                    res = checks.intersection_check(
-                        msg.sender.pos, msg.sender.pos_noise,
-                        data.sender.pos, data.sender.pos_noise,
-                        msg.sender.hed, data.sender.hed,
-                        Coord(5, 1.8, 1.5), delta_time)
-
-                    prediction_results['intersection_check'] += res
-
-                    if res < 0.5:
-                        activations['intersection_check'] = True
-                        break
-
-        if msg.sender_id not in history_data:
-            history_data[msg.sender_id] = []
-
-        history_data[msg.sender_id].append(msg)
-        history_data[msg.sender_id] = history_data[msg.sender_id][-10:]
-
-        result['prediction'] = 1 if any(activations.values()) else 0
-        for check_name, check_value in prediction_results.items():
-            result[f'check_{check_name}'] = check_value
-
-        return pd.Series(result)
-
-    check_results = messages.apply(process_row, axis=1)
-    for col in check_results.columns:
-        messages[col] = check_results[col].values
-
+    check_results = pd.DataFrame(results, index=messages.index)
+    for column in check_results.columns:
+        messages[column] = check_results[column]
     return messages
+
+
+def apply_catch_gate(messages: pd.DataFrame, params: Parameters) -> pd.DataFrame:
+    if messages.empty:
+        return messages.copy()
+
+    normalized = pd.json_normalize(messages.to_dict(orient='records'), sep='_')
+    results = process(
+        Path(), 100, params, normalized, None, return_results=True
+    )
+    check_columns = [
+        column for column in results.columns if column.startswith('check_')
+    ]
+
+    gated = messages.reset_index(drop=True).copy()
+    gated['catch_prediction'] = results['prediction'].astype(int)
+    gated['catch_failed_checks'] = results.apply(
+        lambda row: [
+            column.removeprefix('check_')
+            for column in check_columns
+            if pd.notna(row[column]) and row[column] < 0.5
+        ],
+        axis=1,
+    )
+    return gated
 
 
 def perform_legacy_checks(messages: pd.DataFrame, checks: LegacyChecks) -> pd.DataFrame:
@@ -264,7 +304,10 @@ def perform_legacy_checks(messages: pd.DataFrame, checks: LegacyChecks) -> pd.Da
     return messages
 
 
-def process(input_file: Path, option: int, params: Parameters, df: pd.DataFrame, source_file):
+def process(
+    input_file: Path, option: int, params: Parameters, df: pd.DataFrame,
+    source_file, return_results=False,
+):
     if df.empty:
         with open(input_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -273,13 +316,15 @@ def process(input_file: Path, option: int, params: Parameters, df: pd.DataFrame,
             print(f"Datei {input_file} ist leer, überspringe...", file=sys.stderr)
             return
         df = pd.json_normalize(data, sep='_')
+        df['message_type'] = input_file.parent.name.upper() \
+            if input_file.parent.name in {'cam', 'cpm'} else 'CAM'
 
     # Metadaten Felder
     df['rcvTime'] = df['rcvTime'].astype(int)
     df['sendTime'] = df['sendTime'].astype(int)
     df['sender_id'] = df['sender_id'].astype(str)
     df['sender_alias'] = df['sender_alias'].astype(int)
-    df['messageID'] = df['messageID'].astype(int)
+    df['messageID'] = df['messageID'].astype(str)
     df['attacker'] = df['attacker'].astype(int)
     df['prediction'] = 0
 
@@ -339,9 +384,11 @@ def process(input_file: Path, option: int, params: Parameters, df: pd.DataFrame,
             df['sender_pos_noise'].tolist(), index=df.index, columns=['lat_noise', 'lon_noise', 'alt_noise']
         )
 
-    if option == 0:
+    df = df.sort_values(['rcvTime', 'sendTime', 'messageID'], kind='mergesort').reset_index(drop=True)
+
+    if option in (0, 100):
         checks = CatchChecks(params)
-        results = perform_catch_checks(df, checks)
+        results = perform_catch_checks(df, checks, use_alias=option == 100)
     elif option == 1:
         checks = LegacyChecks(params)
         results = perform_legacy_checks(df, checks)
@@ -350,4 +397,4 @@ def process(input_file: Path, option: int, params: Parameters, df: pd.DataFrame,
 
     #save_messages(results, input_file, source_file)
 
-    return calculate_metrics(results)
+    return results if return_results else calculate_metrics(results)

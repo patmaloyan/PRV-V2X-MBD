@@ -24,8 +24,8 @@ def valid_alias(value):
 
 
 class CpmEnhancedDetector(CamCpmKalmanDetector):
-    def __init__(self, required_unreciprocated_edges=1):
-        super().__init__()
+    def __init__(self, catch_params=None, required_unreciprocated_edges=1):
+        super().__init__(catch_params)
         self.required_unreciprocated_edges = required_unreciprocated_edges
         self.edges = {}
         self.last_unreciprocated_targets = []
@@ -110,8 +110,11 @@ class CpmEnhancedDetector(CamCpmKalmanDetector):
         }
 
 
-def process_cpm_enhanced_folder(input_folder: Path, required_unreciprocated_edges=1):
+def process_cpm_enhanced_folder(
+    input_folder: Path, catch_params, required_unreciprocated_edges=1
+):
     return process_cam_cpm_kalman_folder(
         input_folder,
-        lambda: CpmEnhancedDetector(required_unreciprocated_edges),
+        catch_params,
+        lambda params: CpmEnhancedDetector(params, required_unreciprocated_edges),
     )

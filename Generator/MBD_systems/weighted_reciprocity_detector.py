@@ -93,7 +93,7 @@ def pair_score(inbound, outbound):
 
 
 def maintained_trust_pair_score(inbound, outbound):
-    """Type 7/8 score; the outbound-only penalty uses w_AB directly."""
+    """Type 7/20 score; the outbound-only penalty uses w_AB directly."""
     if inbound is not None and outbound is not None:
         return RECIPROCITY_BOTH_DIRECTIONS_COEFFICIENT * math.sqrt(
             inbound.weight * outbound.weight
@@ -106,8 +106,8 @@ def maintained_trust_pair_score(inbound, outbound):
 
 
 class WeightedReciprocityDetector(CamCpmKalmanDetector):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, catch_params=None):
+        super().__init__(catch_params)
         self.current_bucket = None
         self.bucket_edges = {}
         self.track_ids = {}
@@ -183,7 +183,9 @@ class WeightedReciprocityDetector(CamCpmKalmanDetector):
         self, cam_path: Path | None, cpm_path: Path | None,
         ego_path: Path | None,
     ):
-        messages = combined_message_frame(cam_path, cpm_path)
+        messages = self.catch_messages(
+            combined_message_frame(cam_path, cpm_path)
+        )
         ego_snapshots = sorted(
             load_json_list(ego_path), key=lambda msg: int(msg["sendTime"])
         )
@@ -191,34 +193,38 @@ class WeightedReciprocityDetector(CamCpmKalmanDetector):
         rows = []
 
         for message in messages.to_dict(orient="records"):
-            self.advance_to(message["rcvTime"])
             message_type = str(message["message_type"]).upper()
-            base_decision = self.process_cam(message, ego_snapshots)
-
-            source_track = self.tracks_by_station_alias.get(
-                int(message.get("sender_alias", 0))
-            )
+            catch_prediction = int(message["catch_prediction"])
             source_state = None
             self.current_source_track_id = None
-            if source_track is not None:
-                self.current_source_track_id = self.track_id(source_track, create_trust=True)
-                source_state = self.trust[self.current_source_track_id]
+            if catch_prediction:
+                base_decision = None
+                source_decision = self.catch_rejection()
+            else:
+                self.advance_to(message["rcvTime"])
+                base_decision = self.process_cam(message, ego_snapshots)
+                source_track = self.tracks_by_station_alias.get(
+                    int(message.get("sender_alias", 0))
+                )
+                if source_track is not None:
+                    self.current_source_track_id = self.track_id(source_track, create_trust=True)
+                    source_state = self.trust[self.current_source_track_id]
 
-            externally_accepted = base_decision["accepted"] and (
-                source_state is None or source_state.accepted
-            )
-            source_decision = dict(base_decision)
-            if base_decision["accepted"] and not externally_accepted:
-                source_decision.update(decision(
-                    False, "weighted_reciprocity_quarantine",
-                    base_decision.get("pos_error"),
-                    base_decision.get("speed_error"),
-                    base_decision.get("matched_id"), base_decision.get("nis"),
-                ))
+                externally_accepted = base_decision["accepted"] and (
+                    source_state is None or source_state.accepted
+                )
+                source_decision = dict(base_decision)
+                if base_decision["accepted"] and not externally_accepted:
+                    source_decision.update(decision(
+                        False, "weighted_reciprocity_quarantine",
+                        base_decision.get("pos_error"),
+                        base_decision.get("speed_error"),
+                        base_decision.get("matched_id"), base_decision.get("nis"),
+                    ))
 
             object_counts = empty_object_counts()
             if message_type == "CPM":
-                if base_decision["accepted"]:
+                if base_decision is not None and base_decision["accepted"]:
                     object_counts = self.process_perceived_objects(message)
                 else:
                     objects = message.get("perceivedObjects", [])
@@ -241,6 +247,7 @@ class WeightedReciprocityDetector(CamCpmKalmanDetector):
                 "attacker": int(message.get("attacker", 0)),
                 "prediction": 0 if source_decision["accepted"] else 1,
                 **source_decision,
+                **self.catch_debug(message, source_decision),
                 **object_counts,
                 "reciprocity_bucket": self.current_bucket,
                 "reciprocity_track_id": self.current_source_track_id,
@@ -297,8 +304,10 @@ class WeightedReciprocityDetector(CamCpmKalmanDetector):
         }
 
 
-def process_weighted_reciprocity_folder(input_folder: Path):
-    return process_cam_cpm_kalman_folder(input_folder, WeightedReciprocityDetector)
+def process_weighted_reciprocity_folder(input_folder: Path, catch_params):
+    return process_cam_cpm_kalman_folder(
+        input_folder, catch_params, WeightedReciprocityDetector
+    )
 
 
 class MaintainedTrustReciprocityDetector(WeightedReciprocityDetector):
@@ -376,20 +385,20 @@ class MaintainedTrustReciprocityDetector(WeightedReciprocityDetector):
         return maintained_trust_pair_score(inbound, outbound)
 
 
-def process_maintained_trust_reciprocity_folder(input_folder: Path):
+def process_maintained_trust_reciprocity_folder(input_folder: Path, catch_params):
     return process_cam_cpm_kalman_folder(
-        input_folder, MaintainedTrustReciprocityDetector
+        input_folder, catch_params, MaintainedTrustReciprocityDetector
     )
 
 
 class NoAnonymousMaintainedTrustDetector(MaintainedTrustReciprocityDetector):
-    """Type 8: maintained trust without CPM-initialized anonymous tracks."""
+    """Type 20: maintained trust without CPM-initialized anonymous tracks."""
 
     def add_anonymous_object_track(self, measurement):
         return False
 
 
-def process_no_anonymous_maintained_trust_folder(input_folder: Path):
+def process_no_anonymous_maintained_trust_folder(input_folder: Path, catch_params):
     return process_cam_cpm_kalman_folder(
-        input_folder, NoAnonymousMaintainedTrustDetector
+        input_folder, catch_params, NoAnonymousMaintainedTrustDetector
     )

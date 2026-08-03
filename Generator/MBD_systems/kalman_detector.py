@@ -7,6 +7,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from data_processing import apply_catch_gate
+from data_structures import Parameters
 from kalman_filter import (
     KalmanTrack,
     PROCESS_ACCELERATION_STD_MPS2,
@@ -23,7 +25,6 @@ NIS_THRESHOLD = 13.28
 # Do not authenticate against a Kalman prediction whose covariance has grown stale.
 MAX_NIS_PREDICTION_GAP_S = 2.0
 MAX_NIS_PREDICTION_GAP_NS = int(MAX_NIS_PREDICTION_GAP_S * 1_000_000_000)
-WIRELESS_RANGE_M = 300.0
 RANGE_MARGIN_M = 50.0
 EGO_LOOKBACK_NS = 2_000_000_000
 CPM_SENSOR_RANGE_M = 80.0
@@ -32,21 +33,38 @@ TRACK_EXPIRY_NS = PSEUDONYM_INTERVAL_S * 1_000_000_000
 
 
 class CamOnlyKalmanDetector:
-    def __init__(self):
+    def __init__(self, catch_params=None):
+        self.catch_params = catch_params or Parameters()
+        self.wireless_range_m = self.catch_params.MAX_PLAUSIBLE_RANGE
         self.tracks = []
         self.tracks_by_station_alias = {}
         self.initial_covariance = SENSOR_MEASUREMENT_COVARIANCE.copy()
         self.measurement_noise = SENSOR_MEASUREMENT_COVARIANCE.copy()
 
+    def catch_messages(self, messages):
+        return apply_catch_gate(messages, self.catch_params)
+
+    def catch_rejection(self):
+        return catch_rejection()
+
+    def catch_debug(self, message, source_decision):
+        return gate_debug(message, source_decision)
+
     def process_receiver(self, cam_path: Path, ego_path: Path | None):
-        cam_messages = sorted(load_json_list(cam_path), key=lambda msg: int(msg["rcvTime"]))
+        messages = self.catch_messages(combined_message_frame(cam_path, None))
         ego_snapshots = sorted(load_json_list(ego_path), key=lambda msg: int(msg["sendTime"]))
 
         rows = []
-        for cam in cam_messages:
-            decision = self.process_cam(cam, ego_snapshots)
+        for cam in messages.to_dict(orient="records"):
+            catch_prediction = int(cam["catch_prediction"])
+            source_decision = (
+                self.catch_rejection()
+                if catch_prediction
+                else self.process_cam(cam, ego_snapshots)
+            )
             rows.append({
                 "receiver_id": cam_path.stem,
+                "message_type": "CAM",
                 "messageID": cam.get("messageID"),
                 "sender_id": cam.get("sender_id"),
                 "sender_alias": cam.get("sender_alias", 0),
@@ -55,8 +73,9 @@ class CamOnlyKalmanDetector:
                 "sendTime": int(cam.get("sendTime", 0)),
                 "rcvTime": int(cam.get("rcvTime", 0)),
                 "attacker": int(cam.get("attacker", 0)),
-                "prediction": 0 if decision["accepted"] else 1,
-                **decision,
+                "prediction": 0 if source_decision["accepted"] else 1,
+                **source_decision,
+                **self.catch_debug(cam, source_decision),
             })
 
         return pd.DataFrame(rows)
@@ -180,7 +199,11 @@ class CamOnlyKalmanDetector:
         receiver_pos = parse_position(cam["receiver"]["pos"])
         sender_pos = parse_position(cam["sender"]["pos"])
         distance = float(np.linalg.norm(receiver_pos[0:2] - sender_pos[0:2]))
-        return WIRELESS_RANGE_M - RANGE_MARGIN_M <= distance <= WIRELESS_RANGE_M + RANGE_MARGIN_M
+        return (
+            self.wireless_range_m - RANGE_MARGIN_M
+            <= distance
+            <= self.wireless_range_m + RANGE_MARGIN_M
+        )
 
     def find_ego_sensor_match(self, cam: dict, ego_snapshots: list[dict]):
         snapshot = latest_ego_snapshot(ego_snapshots, int(cam["rcvTime"]))
@@ -218,8 +241,8 @@ class CamOnlyKalmanDetector:
 class CamCpmKalmanDetector(CamOnlyKalmanDetector):
     """Tsukada detector using one time-ordered CAM/CPM stream per receiver."""
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, catch_params=None):
+        super().__init__(catch_params)
 
     def pre_source_decision(self, message: dict):
         return None
@@ -241,18 +264,22 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
 
     def process_receiver(self, cam_path: Path | None, cpm_path: Path | None, ego_path: Path | None):
         # CAMs and CPMs received by this vehicle share one chronological track history.
-        messages = combined_message_frame(cam_path, cpm_path)
+        messages = self.catch_messages(combined_message_frame(cam_path, cpm_path))
         ego_snapshots = sorted(load_json_list(ego_path), key=lambda msg: int(msg["sendTime"]))
         receiver_id = (cam_path or cpm_path).stem
 
         rows = []
         for message in messages.to_dict(orient="records"):
             message_type = str(message["message_type"]).upper()
-            self.prepare_tracks_for_message(message)
-            # Type 4 can reject before Kalman state is changed; type 3 returns None here.
-            source_decision = self.pre_source_decision(message)
-            if source_decision is None:
-                source_decision = self.process_cam(message, ego_snapshots)
+            catch_prediction = int(message["catch_prediction"])
+            if catch_prediction:
+                source_decision = self.catch_rejection()
+            else:
+                self.prepare_tracks_for_message(message)
+                # Type 4 can reject before Kalman state is changed; type 3 returns None here.
+                source_decision = self.pre_source_decision(message)
+                if source_decision is None:
+                    source_decision = self.process_cam(message, ego_snapshots)
             object_counts = empty_object_counts()
             if message_type == "CPM":
                 perceived_objects = message.get("perceivedObjects", [])
@@ -279,6 +306,7 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
                 "attacker": int(message.get("attacker", 0)),
                 "prediction": 0 if source_decision["accepted"] else 1,
                 **source_decision,
+                **self.catch_debug(message, source_decision),
                 **object_counts,
                 **self.message_debug(),
             })
@@ -373,14 +401,14 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
         self.tracks.append(track)
         return True
 
-def process_kalman_folder(input_folder: Path):
+def process_kalman_folder(input_folder: Path, catch_params: Parameters):
     cam_dir = input_folder / "cam"
     ego_dir = input_folder / "ego"
 
     receiver_results = []
     for cam_path in sorted(cam_dir.glob("*.json")):
         ego_path = ego_dir / cam_path.name if ego_dir.is_dir() else None
-        detector = CamOnlyKalmanDetector()
+        detector = CamOnlyKalmanDetector(catch_params)
         receiver_results.append(detector.process_receiver(cam_path, ego_path))
 
     if not receiver_results:
@@ -388,7 +416,8 @@ def process_kalman_folder(input_folder: Path):
 
     results = pd.concat(receiver_results, ignore_index=True)
     metrics = calculate_metrics(results)
-    metrics["wireless_range_m"] = WIRELESS_RANGE_M
+    add_catch_metrics(metrics, results)
+    metrics["wireless_range_m"] = catch_params.MAX_PLAUSIBLE_RANGE
     metrics["range_margin_m"] = RANGE_MARGIN_M
     metrics["nis_threshold"] = NIS_THRESHOLD
     metrics["max_nis_prediction_gap_s"] = MAX_NIS_PREDICTION_GAP_S
@@ -397,7 +426,10 @@ def process_kalman_folder(input_folder: Path):
     return metrics, results
 
 
-def process_cam_cpm_kalman_folder(input_folder: Path, detector_class=CamCpmKalmanDetector):
+def process_cam_cpm_kalman_folder(
+    input_folder: Path, catch_params: Parameters,
+    detector_factory=CamCpmKalmanDetector,
+):
     cam_dir = input_folder / "cam"
     cpm_dir = input_folder / "cpm"
     ego_dir = input_folder / "ego"
@@ -414,7 +446,7 @@ def process_cam_cpm_kalman_folder(input_folder: Path, detector_class=CamCpmKalma
     for receiver_id in receiver_ids:
         ego_path = ego_dir / f"{receiver_id}.json" if ego_dir.is_dir() else None
         # Kalman state is local to a receiver and must never leak between vehicles.
-        detector = detector_class()
+        detector = detector_factory(catch_params)
         receiver_results.append(detector.process_receiver(
             cam_paths.get(receiver_id), cpm_paths.get(receiver_id), ego_path
         ))
@@ -424,7 +456,8 @@ def process_cam_cpm_kalman_folder(input_folder: Path, detector_class=CamCpmKalma
     # only on CAM decisions so types 2-5 use the same evaluation population.
     evaluated_results = results[results["message_type"] == "CAM"]
     metrics = calculate_metrics(evaluated_results)
-    metrics["wireless_range_m"] = WIRELESS_RANGE_M
+    add_catch_metrics(metrics, evaluated_results)
+    metrics["wireless_range_m"] = catch_params.MAX_PLAUSIBLE_RANGE
     metrics["range_margin_m"] = RANGE_MARGIN_M
     metrics["cpm_sensor_range_m"] = CPM_SENSOR_RANGE_M
     metrics["nis_threshold"] = NIS_THRESHOLD
@@ -517,12 +550,42 @@ def empty_object_counts():
     }
 
 
-def calculate_metrics(results: pd.DataFrame):
-    tp = ((results["attacker"] == 1) & (results["prediction"] == 1)).sum()
-    tn = ((results["attacker"] == 0) & (results["prediction"] == 0)).sum()
-    fp = ((results["attacker"] == 0) & (results["prediction"] == 1)).sum()
-    fn = ((results["attacker"] == 1) & (results["prediction"] == 0)).sum()
+def calculate_metrics(results: pd.DataFrame, prediction_column="prediction"):
+    prediction = results[prediction_column]
+    tp = ((results["attacker"] == 1) & (prediction == 1)).sum()
+    tn = ((results["attacker"] == 0) & (prediction == 0)).sum()
+    fp = ((results["attacker"] == 0) & (prediction == 1)).sum()
+    fn = ((results["attacker"] == 1) & (prediction == 0)).sum()
     return {"tp": int(tp), "tn": int(tn), "fp": int(fp), "fn": int(fn)}
+
+
+def add_catch_metrics(metrics, results):
+    catch_metrics = calculate_metrics(results, "catch_prediction")
+    denominator = catch_metrics["fp"] + catch_metrics["tn"]
+    catch_metrics["false_positive_rate"] = (
+        catch_metrics["fp"] / denominator if denominator else 0.0
+    )
+    failed_checks = results["catch_failed_checks"].explode().dropna()
+    metrics["catch_metrics"] = catch_metrics
+    metrics["catch_check_activations"] = {
+        str(name): int(count)
+        for name, count in failed_checks.value_counts().items()
+    }
+    metrics["kalman_skipped"] = int(results["kalman_skipped"].sum())
+
+
+def catch_rejection():
+    return decision(False, "catch_reject", None, None, None)
+
+
+def gate_debug(message, source_decision):
+    skipped = bool(message["catch_prediction"])
+    return {
+        "catch_prediction": int(message["catch_prediction"]),
+        "catch_failed_checks": message["catch_failed_checks"],
+        "kalman_skipped": skipped,
+        "kalman_prediction": None if skipped else int(not source_decision["accepted"]),
+    }
 
 
 def load_json_list(path: Path | None):

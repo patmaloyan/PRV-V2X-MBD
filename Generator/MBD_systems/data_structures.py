@@ -38,7 +38,7 @@ class Message:
     sendTime: int = 0
     sender_id: str = 0
     sender_alias: int = 0
-    messageID: int = 0
+    messageID: str = ""
     attacker: int = 0
     prediction: int = 0
     receiver: VehicleData = field(default_factory=VehicleData)
@@ -109,7 +109,7 @@ class Mapper:
             sendTime=int(row['sendTime']),
             sender_id=row['sender_id'],
             sender_alias=int(row['sender_alias']),
-            messageID=int(row['messageID']),
+            messageID=str(row['messageID']),
             attacker=int(row['attacker']),
             prediction=0,
             receiver=receiver,

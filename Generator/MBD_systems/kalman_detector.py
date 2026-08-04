@@ -82,19 +82,21 @@ class CamOnlyKalmanDetector:
 
         return pd.DataFrame(rows)
 
-    def process_cam(self, cam: dict, ego_snapshots: list[dict]):
+    def process_cam(
+        self, cam: dict, ego_snapshots: list[dict], commit: bool = True,
+    ):
         self.prepare_tracks_for_message(cam)
 
         # Flowchart order: known alias, pseudonym change, then new vehicle.
-        known_result = self.known_station_alias_check(cam, ego_snapshots)
+        known_result = self.known_station_alias_check(cam, ego_snapshots, commit)
         if known_result is not None:
             return known_result
 
-        pseudonym_result = self.pseudonym_change_check(cam)
+        pseudonym_result = self.pseudonym_change_check(cam, commit)
         if pseudonym_result is not None:
             return pseudonym_result
 
-        return self.new_vehicle_check(cam, ego_snapshots)
+        return self.new_vehicle_check(cam, ego_snapshots, commit)
 
     def prepare_tracks_for_message(self, message):
         current_time = int(message["rcvTime"])
@@ -106,21 +108,25 @@ class CamOnlyKalmanDetector:
                 self.tracks_by_station_alias.pop(track.station_alias)
         self.tracks = active_tracks
 
-    def known_station_alias_check(self, cam: dict, ego_snapshots: list[dict]):
+    def known_station_alias_check(
+        self, cam: dict, ego_snapshots: list[dict], commit: bool = True,
+    ):
         track = self.tracks_by_station_alias.get(int(cam["sender_alias"]))
         if track is None:
             return None
 
         deviation = track.deviation_against_cam(cam, self.measurement_noise)
         if not nis_prediction_is_fresh(track, int(cam["rcvTime"])):
-            track.reset_from_cam(cam, self.initial_covariance)
+            if commit:
+                track.reset_from_cam(cam, self.initial_covariance)
             return decision(
                 True, "known_alias_stale_reset_accept", deviation.position_error,
                 deviation.speed_error, track.station_alias, deviation.nis,
             )
 
         if nis_within_threshold(deviation.nis, KNOWN_ALIAS_NIS_THRESHOLD):
-            track.update_from_cam(cam, self.measurement_noise)
+            if commit:
+                track.update_from_cam(cam, self.measurement_noise)
             return decision(
                 True, "known_alias_accept", deviation.position_error,
                 deviation.speed_error, track.station_alias, deviation.nis,
@@ -131,7 +137,7 @@ class CamOnlyKalmanDetector:
             deviation.speed_error, track.station_alias, deviation.nis,
         )
 
-    def pseudonym_change_check(self, cam: dict):
+    def pseudonym_change_check(self, cam: dict, commit: bool = True):
         best_track = None
         best_pos_error = None
         best_speed_error = None
@@ -154,32 +160,39 @@ class CamOnlyKalmanDetector:
             return None
 
         old_station_alias = best_track.station_alias
-        self.tracks_by_station_alias.pop(old_station_alias, None)
-        best_track.station_alias = int(cam["sender_alias"])
-        self.tracks_by_station_alias[best_track.station_alias] = best_track
-        best_track.update_from_cam(cam, self.measurement_noise)
+        if commit:
+            self.tracks_by_station_alias.pop(old_station_alias, None)
+            best_track.station_alias = int(cam["sender_alias"])
+            self.tracks_by_station_alias[best_track.station_alias] = best_track
+            best_track.update_from_cam(cam, self.measurement_noise)
         return decision(
             True, "pseudonym_accept", best_pos_error, best_speed_error,
             old_station_alias, best_nis,
         )
 
-    def new_vehicle_check(self, cam: dict, ego_snapshots: list[dict]):
+    def new_vehicle_check(
+        self, cam: dict, ego_snapshots: list[dict], commit: bool = True,
+    ):
         # A new ID is accepted if it just entered, appears near range edge, or is seen by the receiver.
         if sender_just_entered(cam) == 1:
-            self.add_track(cam)
+            if commit:
+                self.add_track(cam)
             return decision(True, "new_vehicle_sender_zone_entry_accept", None, None, None)
 
         if receiver_just_entered(cam) == 1:
-            self.add_track(cam)
+            if commit:
+                self.add_track(cam)
             return decision(True, "new_vehicle_receiver_zone_entry_accept", None, None, None)
 
         if self.within_wireless_margin(cam):
-            self.add_track(cam)
+            if commit:
+                self.add_track(cam)
             return decision(True, "new_vehicle_margin_accept", None, None, None)
 
         ego_match = self.find_ego_sensor_match(cam, ego_snapshots)
         if ego_match is not None:
-            self.add_track(cam)
+            if commit:
+                self.add_track(cam)
             return decision( True, "new_vehicle_ego_accept", ego_match["pos_error"],
                 ego_match["speed_error"], ego_match["object_id"])
 

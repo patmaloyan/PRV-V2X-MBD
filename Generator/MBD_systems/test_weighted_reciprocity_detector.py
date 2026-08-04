@@ -1,8 +1,12 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 
 from weighted_reciprocity_detector import (
     CPM_SENSOR_RANGE_M,
-    NIS_THRESHOLD,
+    RECIPROCITY_NIS_THRESHOLD,
     EdgeEvidence,
     MaintainedTrustReciprocityDetector,
     MaintainedVehicleTrust,
@@ -17,10 +21,54 @@ from weighted_reciprocity_detector import (
 )
 
 
+def source_message(message_type="CAM", alias=10, position=0.0, rcv_time=1):
+    return {
+        "messageID": f"{message_type.lower()}_{rcv_time}",
+        "rcvTime": rcv_time,
+        "sendTime": rcv_time,
+        "sender_id": "veh_1",
+        "sender_alias": alias,
+        "attacker": 0,
+        "receiver": {"pos": "0,0,0"},
+        "sender": {
+            "pos": f"{position},0,0",
+            "spd": 0.0,
+            "hed": 0.0,
+            "acl": 0.0,
+        },
+        "perceivedObjects": [],
+    }
+
+
+class PassCatchMaintainedDetector(MaintainedTrustReciprocityDetector):
+    def __init__(self):
+        super().__init__()
+        self.object_calls = 0
+
+    def catch_messages(self, messages):
+        messages = messages.copy()
+        messages["catch_prediction"] = 0
+        messages["catch_failed_checks"] = [[] for _ in range(len(messages))]
+        return messages
+
+    def process_perceived_objects(self, cpm):
+        self.object_calls += 1
+        return super().process_perceived_objects(cpm)
+
+
+def process_source(detector, message_type, message):
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "veh_receiver.json"
+        path.write_text(json.dumps([message]), encoding="utf-8")
+        if message_type == "CAM":
+            return detector.process_receiver(path, None, None).iloc[0]
+        return detector.process_receiver(None, path, None).iloc[0]
+
+
 class WeightedReciprocityMathTests(unittest.TestCase):
     def test_nis_confidence_uses_gate_domain_without_clamping(self):
         self.assertEqual(nis_confidence(0.0), 1.0)
-        self.assertEqual(nis_confidence(NIS_THRESHOLD), 0.5)
+        self.assertEqual(nis_confidence(RECIPROCITY_NIS_THRESHOLD), 0.0)
 
     def test_distance_opportunity_is_clamped(self):
         self.assertEqual(distance_opportunity(-1.0), 1.0)
@@ -43,10 +91,28 @@ class WeightedReciprocityMathTests(unittest.TestCase):
         self.assertEqual(maintained_trust_pair_score(None, outbound), -0.5)
 
     def test_edge_weight_combines_distance_and_confidence(self):
-        evidence = edge_evidence(NIS_THRESHOLD, CPM_SENSOR_RANGE_M / 2.0)
+        evidence = edge_evidence(
+            RECIPROCITY_NIS_THRESHOLD / 2.0,
+            CPM_SENSOR_RANGE_M / 2.0,
+        )
         self.assertEqual(evidence.confidence, 0.5)
         self.assertEqual(evidence.opportunity, 0.5)
         self.assertEqual(evidence.weight, 0.25)
+
+    def test_reciprocity_matching_uses_its_own_threshold(self):
+        detector = WeightedReciprocityDetector()
+        track = object()
+        detector.closest_track = lambda measurement: (
+            track,
+            SimpleNamespace(nis=RECIPROCITY_NIS_THRESHOLD),
+        )
+        self.assertEqual(len(detector.perceived_object_matches({})), 1)
+
+        detector.closest_track = lambda measurement: (
+            track,
+            SimpleNamespace(nis=RECIPROCITY_NIS_THRESHOLD + 0.01),
+        )
+        self.assertEqual(detector.perceived_object_matches({}), [])
 
 
 class WeightedReciprocityStateTests(unittest.TestCase):
@@ -64,6 +130,76 @@ class WeightedReciprocityStateTests(unittest.TestCase):
 
         self.assertLess(result["scores"][1], 0.0)
         self.assertEqual(result["scores"][2], 0.0)
+
+
+class FinalDecisionCommitTests(unittest.TestCase):
+    def quarantined_detector(self):
+        detector = PassCatchMaintainedDetector()
+        first = source_message(rcv_time=0)
+        detector.add_track(first)
+        track = detector.tracks[0]
+        track_id = detector.track_id(track, create_trust=True)
+        detector.trust[track_id].accepted = False
+        detector.trust[track_id].score = -0.25
+        return detector, track
+
+    def test_quarantine_does_not_update_known_track(self):
+        detector, track = self.quarantined_detector()
+        initial_state = track.filter.x.copy()
+
+        result = process_source(
+            detector, "CAM", source_message(position=10.0, rcv_time=1),
+        )
+
+        self.assertEqual(result["reason"], "weighted_reciprocity_quarantine")
+        self.assertEqual(result["kalman_prediction"], 0)
+        self.assertEqual(track.last_update_time, 0)
+        self.assertTrue((track.filter.x == initial_state).all())
+
+    def test_quarantine_does_not_reset_stale_track(self):
+        detector, track = self.quarantined_detector()
+
+        result = process_source(
+            detector, "CAM", source_message(position=10.0, rcv_time=3_100_000_000),
+        )
+
+        self.assertEqual(result["reason"], "weighted_reciprocity_quarantine")
+        self.assertEqual(track.last_update_time, 0)
+
+    def test_quarantine_does_not_commit_pseudonym_change(self):
+        detector, track = self.quarantined_detector()
+
+        result = process_source(
+            detector, "CAM", source_message(alias=11, rcv_time=1),
+        )
+
+        self.assertEqual(result["reason"], "weighted_reciprocity_quarantine")
+        self.assertEqual(track.station_alias, 10)
+        self.assertIs(detector.tracks_by_station_alias[10], track)
+        self.assertNotIn(11, detector.tracks_by_station_alias)
+
+    def test_quarantine_skips_cpm_objects(self):
+        detector, track = self.quarantined_detector()
+
+        result = process_source(
+            detector, "CPM", source_message("CPM", rcv_time=1),
+        )
+
+        self.assertEqual(result["reason"], "weighted_reciprocity_quarantine")
+        self.assertEqual(detector.object_calls, 0)
+        self.assertEqual(track.last_update_time, 0)
+
+    def test_final_acceptance_commits_update(self):
+        detector, track = self.quarantined_detector()
+        detector.trust[detector.track_ids[id(track)]].accepted = True
+
+        result = process_source(
+            detector, "CAM", source_message(position=10.0, rcv_time=1),
+        )
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual(track.last_update_time, 1)
+        self.assertNotEqual(track.filter.x[0], 0.0)
 
 
 class RollingAverageStateTests(unittest.TestCase):

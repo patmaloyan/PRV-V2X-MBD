@@ -317,6 +317,7 @@ def main():
         for key in [
             "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
             "nis_threshold", "known_alias_nis_threshold", "max_nis_prediction_gap_s",
+            "reciprocity_nis_threshold",
             "process_acceleration_std_mps2",
             "total_messages", "cam_messages", "cpm_messages",
         ]:
@@ -352,6 +353,7 @@ def main():
         for key in [
             "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
             "nis_threshold", "known_alias_nis_threshold", "max_nis_prediction_gap_s",
+            "reciprocity_nis_threshold",
             "process_acceleration_std_mps2",
             "total_messages", "cam_messages", "cpm_messages",
         ]:
@@ -387,6 +389,7 @@ def main():
         for key in [
             "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
             "nis_threshold", "known_alias_nis_threshold", "max_nis_prediction_gap_s",
+            "reciprocity_nis_threshold",
             "process_acceleration_std_mps2",
             "total_messages", "cam_messages", "cpm_messages",
         ]:

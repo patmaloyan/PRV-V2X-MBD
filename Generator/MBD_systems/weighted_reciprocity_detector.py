@@ -10,7 +10,6 @@ import pandas as pd
 
 from kalman_detector import (
     CPM_SENSOR_RANGE_M,
-    NIS_THRESHOLD,
     CamCpmKalmanDetector,
     combined_message_frame,
     decision,
@@ -30,6 +29,7 @@ RECIPROCITY_INBOUND_ONLY_COEFFICIENT = 1.0
 RECIPROCITY_OUTBOUND_ONLY_COEFFICIENT = -2.0
 TRUST_ALPHA = 1.0 / 3.0
 MAX_PAIR_SCORE_MAGNITUDE = 2.0
+RECIPROCITY_NIS_THRESHOLD = 18.47
 
 
 @dataclass
@@ -56,7 +56,7 @@ class MaintainedVehicleTrust:
 
 
 def nis_confidence(nis):
-    return 1.0 - 0.5 * (float(nis) / NIS_THRESHOLD)
+    return 1.0 - float(nis) / RECIPROCITY_NIS_THRESHOLD
 
 
 def distance_opportunity(distance):
@@ -115,6 +115,15 @@ class WeightedReciprocityDetector(CamCpmKalmanDetector):
         self.trust = {}
         self.last_closed_intervals = []
         self.current_source_track_id = None
+
+    def perceived_object_matches(self, measurement):
+        best_track, deviation = self.closest_track(measurement)
+        if (
+            best_track is not None
+            and deviation.nis <= RECIPROCITY_NIS_THRESHOLD
+        ):
+            return [(best_track, deviation)]
+        return []
 
     def track_id(self, track, create_trust=False):
         key = id(track)
@@ -202,19 +211,42 @@ class WeightedReciprocityDetector(CamCpmKalmanDetector):
                 source_decision = self.catch_rejection()
             else:
                 self.advance_to(message["rcvTime"])
-                base_decision = self.process_cam(message, ego_snapshots)
+                base_decision = self.process_cam(
+                    message, ego_snapshots, commit=False
+                )
                 source_track = self.tracks_by_station_alias.get(
                     int(message.get("sender_alias", 0))
                 )
+                if (
+                    source_track is None
+                    and base_decision["reason"] == "pseudonym_accept"
+                ):
+                    source_track = self.tracks_by_station_alias.get(
+                        int(base_decision["matched_id"])
+                    )
                 if source_track is not None:
-                    self.current_source_track_id = self.track_id(source_track, create_trust=True)
-                    source_state = self.trust[self.current_source_track_id]
+                    self.current_source_track_id = self.track_ids.get(
+                        id(source_track)
+                    )
+                    source_state = self.trust.get(self.current_source_track_id)
 
                 externally_accepted = base_decision["accepted"] and (
                     source_state is None or source_state.accepted
                 )
                 source_decision = dict(base_decision)
-                if base_decision["accepted"] and not externally_accepted:
+                if externally_accepted:
+                    source_decision = self.process_cam(
+                        message, ego_snapshots, commit=True
+                    )
+                    source_track = self.tracks_by_station_alias.get(
+                        int(message.get("sender_alias", 0))
+                    )
+                    if source_track is not None:
+                        self.current_source_track_id = self.track_id(
+                            source_track, create_trust=True
+                        )
+                        source_state = self.trust[self.current_source_track_id]
+                elif base_decision["accepted"]:
                     source_decision.update(decision(
                         False, "weighted_reciprocity_quarantine",
                         base_decision.get("pos_error"),
@@ -224,7 +256,7 @@ class WeightedReciprocityDetector(CamCpmKalmanDetector):
 
             object_counts = empty_object_counts()
             if message_type == "CPM":
-                if base_decision is not None and base_decision["accepted"]:
+                if source_decision["accepted"]:
                     object_counts = self.process_perceived_objects(message)
                 else:
                     objects = message.get("perceivedObjects", [])
@@ -247,7 +279,7 @@ class WeightedReciprocityDetector(CamCpmKalmanDetector):
                 "attacker": int(message.get("attacker", 0)),
                 "prediction": 0 if source_decision["accepted"] else 1,
                 **source_decision,
-                **self.catch_debug(message, source_decision),
+                **self.catch_debug(message, base_decision or source_decision),
                 **object_counts,
                 "reciprocity_bucket": self.current_bucket,
                 "reciprocity_track_id": self.current_source_track_id,
@@ -305,9 +337,11 @@ class WeightedReciprocityDetector(CamCpmKalmanDetector):
 
 
 def process_weighted_reciprocity_folder(input_folder: Path, catch_params):
-    return process_cam_cpm_kalman_folder(
+    metrics, results = process_cam_cpm_kalman_folder(
         input_folder, catch_params, WeightedReciprocityDetector
     )
+    metrics["reciprocity_nis_threshold"] = RECIPROCITY_NIS_THRESHOLD
+    return metrics, results
 
 
 class MaintainedTrustReciprocityDetector(WeightedReciprocityDetector):
@@ -386,9 +420,11 @@ class MaintainedTrustReciprocityDetector(WeightedReciprocityDetector):
 
 
 def process_maintained_trust_reciprocity_folder(input_folder: Path, catch_params):
-    return process_cam_cpm_kalman_folder(
+    metrics, results = process_cam_cpm_kalman_folder(
         input_folder, catch_params, MaintainedTrustReciprocityDetector
     )
+    metrics["reciprocity_nis_threshold"] = RECIPROCITY_NIS_THRESHOLD
+    return metrics, results
 
 
 class NoAnonymousMaintainedTrustDetector(MaintainedTrustReciprocityDetector):
@@ -399,6 +435,8 @@ class NoAnonymousMaintainedTrustDetector(MaintainedTrustReciprocityDetector):
 
 
 def process_no_anonymous_maintained_trust_folder(input_folder: Path, catch_params):
-    return process_cam_cpm_kalman_folder(
+    metrics, results = process_cam_cpm_kalman_folder(
         input_folder, catch_params, NoAnonymousMaintainedTrustDetector
     )
+    metrics["reciprocity_nis_threshold"] = RECIPROCITY_NIS_THRESHOLD
+    return metrics, results

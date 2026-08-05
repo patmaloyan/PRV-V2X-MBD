@@ -3,6 +3,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pandas as pd
+import numpy as np
+
 from data_structures import Parameters
 from kalman_detector import (
     MAX_NIS_PREDICTION_GAP_NS,
@@ -11,6 +14,7 @@ from kalman_detector import (
     CamCpmKalmanDetector,
     CamOnlyKalmanDetector,
     decision,
+    evaluation_receiver_ids,
     nis_prediction_is_fresh,
 )
 
@@ -69,6 +73,42 @@ class StubCpmDetector(CamCpmKalmanDetector):
 
 
 class CatchKalmanGateTests(unittest.TestCase):
+    def test_cpm_association_includes_two_vehicle_gnss_biases(self):
+        detector = CamCpmKalmanDetector(Parameters(), catch_enabled=False)
+        detector.add_track(message(sender_x=0.0))
+        track = detector.tracks[0]
+        track.filter.P = np.zeros((4, 4))
+
+        measurement = message("CPM", sender_x=8.0)
+        measurement["rcvTime"] = 2
+        direct_nis = track.deviation_against_cam(
+            measurement, detector.measurement_noise
+        ).nis
+        matches = detector.perceived_object_matches(measurement)
+
+        self.assertGreater(direct_nis, KNOWN_ALIAS_NIS_THRESHOLD)
+        self.assertIs(matches[0][0], track)
+
+    def test_no_catch_bypass_marks_every_message_as_passed(self):
+        detector = CamOnlyKalmanDetector(Parameters(), catch_enabled=False)
+        result = detector.catch_messages(pd.DataFrame([message()])).iloc[0]
+
+        self.assertEqual(result["catch_prediction"], 0)
+        self.assertEqual(result["catch_failed_checks"], [])
+
+    def test_evaluation_uses_only_receivers_with_ego_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_folder = Path(directory)
+            ego_dir = input_folder / "ego"
+            ego_dir.mkdir()
+            (ego_dir / "veh_honest.json").write_text("[]", encoding="utf-8")
+
+            result = evaluation_receiver_ids(
+                input_folder, ["veh_attacker", "veh_honest"]
+            )
+
+        self.assertEqual(result, ["veh_honest"])
+
     def run_cam(self, detector):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "veh_1.json"
@@ -141,7 +181,7 @@ class CatchKalmanGateTests(unittest.TestCase):
         self.assertFalse(nis_prediction_is_fresh(track, changed["rcvTime"]))
         self.assertIsNone(detector.pseudonym_change_check(changed))
 
-    def test_known_alias_uses_separate_permissive_threshold(self):
+    def test_known_alias_uses_standard_nis_threshold(self):
         detector = CamOnlyKalmanDetector(Parameters())
         first = message(sender_x=0.0)
         detector.add_track(first)
@@ -150,9 +190,9 @@ class CatchKalmanGateTests(unittest.TestCase):
         current["rcvTime"] = 2
         result = detector.known_station_alias_check(current, [])
 
-        self.assertEqual(KNOWN_ALIAS_NIS_THRESHOLD, 100.0)
-        self.assertTrue(result["accepted"])
-        self.assertEqual(result["reason"], "known_alias_accept")
+        self.assertEqual(KNOWN_ALIAS_NIS_THRESHOLD, 13.28)
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["reason"], "known_alias_reject")
 
         detector = CamOnlyKalmanDetector(Parameters())
         detector.add_track(first)

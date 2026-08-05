@@ -24,8 +24,11 @@ def valid_alias(value):
 
 
 class CpmEnhancedDetector(CamCpmKalmanDetector):
-    def __init__(self, catch_params=None, required_unreciprocated_edges=1):
-        super().__init__(catch_params)
+    def __init__(
+        self, catch_params=None, required_unreciprocated_edges=1,
+        catch_enabled=True,
+    ):
+        super().__init__(catch_params, catch_enabled)
         self.required_unreciprocated_edges = required_unreciprocated_edges
         self.edges = {}
         self.last_unreciprocated_targets = []
@@ -36,7 +39,7 @@ class CpmEnhancedDetector(CamCpmKalmanDetector):
             if not nis_prediction_is_fresh(track, int(measurement["rcvTime"])):
                 continue
             deviation = track.deviation_against_cam(
-                measurement, self.measurement_noise
+                measurement, self.cpm_association_noise
             )
             if nis_within_threshold(deviation.nis):
                 matches.append((track, deviation))
@@ -111,10 +114,14 @@ class CpmEnhancedDetector(CamCpmKalmanDetector):
 
 
 def process_cpm_enhanced_folder(
-    input_folder: Path, catch_params, required_unreciprocated_edges=1
+    input_folder: Path, catch_params, required_unreciprocated_edges=1,
+    catch_enabled=True,
 ):
     return process_cam_cpm_kalman_folder(
         input_folder,
         catch_params,
-        lambda params: CpmEnhancedDetector(params, required_unreciprocated_edges),
+        lambda params, enabled: CpmEnhancedDetector(
+            params, required_unreciprocated_edges, enabled
+        ),
+        catch_enabled,
     )

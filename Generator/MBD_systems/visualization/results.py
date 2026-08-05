@@ -59,6 +59,11 @@ def parse_args():
         action="store_true",
         help="Disable only CaTCH's road-edge position plausibility check",
     )
+    parser.add_argument(
+        "--no-catch",
+        action="store_true",
+        help="Run Kalman detector types without the CaTCH gate",
+    )
     return parser.parse_args()
 
 
@@ -72,7 +77,7 @@ def validate_args(args):
         raise ValueError("Attacks must not contain duplicates")
 
 
-def run_detector(input_folder, detector_type, no_pos_check=False):
+def run_detector(input_folder, detector_type, no_pos_check=False, no_catch=False):
     print(f"Running type {detector_type} on {input_folder.name}...", flush=True)
     command = [
         sys.executable,
@@ -86,6 +91,8 @@ def run_detector(input_folder, detector_type, no_pos_check=False):
     ]
     if no_pos_check:
         command.append("--no-pos-check")
+    if no_catch:
+        command.append("--no-catch")
     subprocess.run(
         command,
         cwd=REPO_ROOT,
@@ -93,8 +100,10 @@ def run_detector(input_folder, detector_type, no_pos_check=False):
     )
 
 
-def load_metrics(setting_root, input_folder, detector_type):
+def load_metrics(setting_root, input_folder, detector_type, no_catch=False):
     _, result_folder = DETECTORS[detector_type]
+    if no_catch and detector_type != 100:
+        result_folder += "_no_catch"
     metrics_path = setting_root / "results" / input_folder.name / result_folder / "predicted.json"
     if not metrics_path.is_file():
         raise FileNotFoundError(f"Detector did not create {metrics_path}")
@@ -220,6 +229,8 @@ def plot_results(args, results, output_path):
     )
     if args.no_pos_check:
         setting_label += " — No Road-Edge Position Check"
+    if args.no_catch:
+        setting_label += " — No CaTCH Gate"
     figure.suptitle(f"{setting_label} Detection Performance", fontsize=15, weight="bold", y=0.98)
     figure.legend(
         handles,
@@ -266,9 +277,11 @@ def main():
             if not input_folder.is_dir():
                 raise FileNotFoundError(f"Attack input folder does not exist: {input_folder}")
             for detector_type in args.types:
-                run_detector(input_folder, detector_type, args.no_pos_check)
+                run_detector(
+                    input_folder, detector_type, args.no_pos_check, args.no_catch
+                )
                 results[(detector_type, attack)] = load_metrics(
-                    setting_root, input_folder, detector_type
+                    setting_root, input_folder, detector_type, args.no_catch
                 )
 
         output_path = (

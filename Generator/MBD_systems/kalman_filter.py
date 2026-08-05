@@ -6,16 +6,33 @@ import numpy as np
 
 
 # State and measurement vector: [x, y, vx, vy].
-# Fixed approximation of SensorErrorModel.java:
-# position is uniform ±5 m; velocity variance includes its heading error.
-SENSOR_MEASUREMENT_COVARIANCE = np.diag([
+# A new track has absolute GNSS uncertainty from the persistent ±5 m bias.
+INITIAL_STATE_COVARIANCE = np.diag([
     25.0 / 3.0,
     25.0 / 3.0,
     0.25,
     0.25,
 ])
-# Unmodelled acceleration uncertainty used by the constant-acceleration process model.
-PROCESS_ACCELERATION_STD_MPS2 = 3.1
+# Once a track exists, the persistent bias is part of its coordinate offset.
+# Update noise therefore models the changing error between reports. These
+# variances come from benign noCheat2 successive-error measurements.
+SENSOR_MEASUREMENT_COVARIANCE = np.diag([
+    0.01,
+    0.01,
+    0.0036,
+    0.0036,
+])
+# CPM objects and the target track are expressed through two different
+# vehicles' GNSS frames, so their independent persistent biases both apply.
+CPM_ASSOCIATION_COVARIANCE = np.diag([
+    50.0 / 3.0,
+    50.0 / 3.0,
+    0.25,
+    0.25,
+])
+# Continuous white-acceleration noise intensity, calibrated on benign noCheat2
+# innovations so the 99% NIS threshold rejects about 1% of established tracks.
+PROCESS_NOISE_INTENSITY = 3.6
 
 
 @dataclass(frozen=True)
@@ -66,11 +83,13 @@ def motion_matrices(dt: float):
         [dt, 0.0],
         [0.0, dt],
     ])
-    process_noise = PROCESS_ACCELERATION_STD_MPS2**2 * np.array([
-        [dt**4 / 4.0, 0.0, dt**3 / 2.0, 0.0],
-        [0.0, dt**4 / 4.0, 0.0, dt**3 / 2.0],
-        [dt**3 / 2.0, 0.0, dt**2, 0.0],
-        [0.0, dt**3 / 2.0, 0.0, dt**2],
+    # Continuous white-acceleration noise allows benign jerk and turning instead
+    # of forcing position and velocity process errors to be perfectly coupled.
+    process_noise = PROCESS_NOISE_INTENSITY**2 * np.array([
+        [dt**3 / 3.0, 0.0, dt**2 / 2.0, 0.0],
+        [0.0, dt**3 / 3.0, 0.0, dt**2 / 2.0],
+        [dt**2 / 2.0, 0.0, dt, 0.0],
+        [0.0, dt**2 / 2.0, 0.0, dt],
     ])
     return transition, control, process_noise
 

@@ -59,7 +59,7 @@ import java.util.Random;
  */
 public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperatingSystem> {
 
-    // Front sensor setup used to collect perceived objects for CPMs.
+    // 360-degree sensor setup used to collect perceived objects for CPMs.
     private static final double VIEWING_ANGLE = 360d;
     private static final double VIEWING_RANGE = 80d;
     // Send CPMs once per second, using MOSAIC simulation time in nanoseconds.

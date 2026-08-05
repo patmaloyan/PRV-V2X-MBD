@@ -10,8 +10,10 @@ import pandas as pd
 from data_processing import apply_catch_gate
 from data_structures import Parameters
 from kalman_filter import (
+    CPM_ASSOCIATION_COVARIANCE,
+    INITIAL_STATE_COVARIANCE,
     KalmanTrack,
-    PROCESS_ACCELERATION_STD_MPS2,
+    PROCESS_NOISE_INTENSITY,
     SENSOR_MEASUREMENT_COVARIANCE,
     parse_position,
     velocity_from_cam,
@@ -22,8 +24,8 @@ EGO_OBJECT_POSITION_THRESHOLD_M = 10
 EGO_OBJECT_SPEED_THRESHOLD_MPS = 5
 # 99% chi-square threshold for the four measured values [x, y, vx, vy].
 NIS_THRESHOLD = 13.28
-# Known aliases have already passed CaTCH and do not require conservative reassociation.
-KNOWN_ALIAS_NIS_THRESHOLD = 100.0
+# Use the same 99% four-dimensional NIS threshold for established tracks.
+KNOWN_ALIAS_NIS_THRESHOLD = NIS_THRESHOLD
 # F2MD resets a Kalman filter when its last update is this old.
 MAX_NIS_PREDICTION_GAP_S = 3.1
 MAX_NIS_PREDICTION_GAP_NS = int(MAX_NIS_PREDICTION_GAP_S * 1_000_000_000)
@@ -34,17 +36,35 @@ PSEUDONYM_INTERVAL_S = 20
 TRACK_EXPIRY_NS = PSEUDONYM_INTERVAL_S * 1_000_000_000
 
 
+def evaluation_receiver_ids(input_folder: Path, receiver_ids):
+    """Return honest receivers; attacker ego files are omitted during generation."""
+    ego_dir = input_folder / "ego"
+    if not ego_dir.is_dir():
+        return list(receiver_ids)
+    return [
+        receiver_id for receiver_id in receiver_ids
+        if (ego_dir / f"{receiver_id}.json").is_file()
+    ]
+
+
 class CamOnlyKalmanDetector:
-    def __init__(self, catch_params=None):
+    def __init__(self, catch_params=None, catch_enabled=True):
         self.catch_params = catch_params or Parameters()
+        self.catch_enabled = catch_enabled
         self.wireless_range_m = self.catch_params.MAX_PLAUSIBLE_RANGE
         self.tracks = []
         self.tracks_by_station_alias = {}
-        self.initial_covariance = SENSOR_MEASUREMENT_COVARIANCE.copy()
+        self.initial_covariance = INITIAL_STATE_COVARIANCE.copy()
         self.measurement_noise = SENSOR_MEASUREMENT_COVARIANCE.copy()
+        self.cpm_association_noise = CPM_ASSOCIATION_COVARIANCE.copy()
 
     def catch_messages(self, messages):
-        return apply_catch_gate(messages, self.catch_params)
+        if self.catch_enabled:
+            return apply_catch_gate(messages, self.catch_params)
+        messages = messages.reset_index(drop=True).copy()
+        messages["catch_prediction"] = 0
+        messages["catch_failed_checks"] = [[] for _ in range(len(messages))]
+        return messages
 
     def catch_rejection(self):
         return catch_rejection()
@@ -249,8 +269,8 @@ class CamOnlyKalmanDetector:
 class CamCpmKalmanDetector(CamOnlyKalmanDetector):
     """Tsukada detector using one time-ordered CAM/CPM stream per receiver."""
 
-    def __init__(self, catch_params=None):
-        super().__init__(catch_params)
+    def __init__(self, catch_params=None, catch_enabled=True):
+        super().__init__(catch_params, catch_enabled)
 
     def pre_source_decision(self, message: dict):
         return None
@@ -394,7 +414,7 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
             if not nis_prediction_is_fresh(track, int(measurement["rcvTime"])):
                 continue
             deviation = track.deviation_against_cam(
-                measurement, self.measurement_noise
+                measurement, self.cpm_association_noise
             )
             score = deviation.nis
             if score < best_score:
@@ -409,14 +429,19 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
         self.tracks.append(track)
         return True
 
-def process_kalman_folder(input_folder: Path, catch_params: Parameters):
+def process_kalman_folder(
+    input_folder: Path, catch_params: Parameters, catch_enabled=True,
+):
     cam_dir = input_folder / "cam"
     ego_dir = input_folder / "ego"
 
     receiver_results = []
-    for cam_path in sorted(cam_dir.glob("*.json")):
+    cam_paths = {path.stem: path for path in cam_dir.glob("*.json")}
+    receiver_ids = evaluation_receiver_ids(input_folder, sorted(cam_paths))
+    for receiver_id in receiver_ids:
+        cam_path = cam_paths[receiver_id]
         ego_path = ego_dir / cam_path.name if ego_dir.is_dir() else None
-        detector = CamOnlyKalmanDetector(catch_params)
+        detector = CamOnlyKalmanDetector(catch_params, catch_enabled)
         receiver_results.append(detector.process_receiver(cam_path, ego_path))
 
     if not receiver_results:
@@ -430,14 +455,21 @@ def process_kalman_folder(input_folder: Path, catch_params: Parameters):
     metrics["nis_threshold"] = NIS_THRESHOLD
     metrics["known_alias_nis_threshold"] = KNOWN_ALIAS_NIS_THRESHOLD
     metrics["max_nis_prediction_gap_s"] = MAX_NIS_PREDICTION_GAP_S
-    metrics["process_acceleration_std_mps2"] = PROCESS_ACCELERATION_STD_MPS2
+    metrics["process_noise_intensity"] = PROCESS_NOISE_INTENSITY
+    metrics["initial_covariance_diag"] = np.diag(INITIAL_STATE_COVARIANCE).tolist()
+    metrics["measurement_noise_diag"] = np.diag(SENSOR_MEASUREMENT_COVARIANCE).tolist()
+    metrics["cpm_association_noise_diag"] = np.diag(CPM_ASSOCIATION_COVARIANCE).tolist()
+    metrics["process_noise_model"] = "continuous_white_acceleration"
     metrics["total_messages"] = int(len(results))
+    metrics["evaluated_receivers"] = len(receiver_ids)
+    metrics["excluded_attacker_receivers"] = len(cam_paths) - len(receiver_ids)
+    metrics["catch_enabled"] = catch_enabled
     return metrics, results
 
 
 def process_cam_cpm_kalman_folder(
     input_folder: Path, catch_params: Parameters,
-    detector_factory=CamCpmKalmanDetector,
+    detector_factory=CamCpmKalmanDetector, catch_enabled=True,
 ):
     cam_dir = input_folder / "cam"
     cpm_dir = input_folder / "cpm"
@@ -447,15 +479,18 @@ def process_cam_cpm_kalman_folder(
 
     cam_paths = {path.stem: path for path in cam_dir.glob("*.json")}
     cpm_paths = {path.stem: path for path in cpm_dir.glob("*.json")}
-    receiver_ids = sorted(set(cam_paths) | set(cpm_paths))
-    if not receiver_ids:
+    all_receiver_ids = sorted(set(cam_paths) | set(cpm_paths))
+    if not all_receiver_ids:
         raise ValueError(f"No CAM or CPM JSON files found in {input_folder}")
+    receiver_ids = evaluation_receiver_ids(input_folder, all_receiver_ids)
+    if not receiver_ids:
+        raise ValueError(f"No non-attacker receivers found in {input_folder}")
 
     receiver_results = []
     for receiver_id in receiver_ids:
         ego_path = ego_dir / f"{receiver_id}.json" if ego_dir.is_dir() else None
         # Kalman state is local to a receiver and must never leak between vehicles.
-        detector = detector_factory(catch_params)
+        detector = detector_factory(catch_params, catch_enabled)
         receiver_results.append(detector.process_receiver(
             cam_paths.get(receiver_id), cpm_paths.get(receiver_id), ego_path
         ))
@@ -472,10 +507,17 @@ def process_cam_cpm_kalman_folder(
     metrics["nis_threshold"] = NIS_THRESHOLD
     metrics["known_alias_nis_threshold"] = KNOWN_ALIAS_NIS_THRESHOLD
     metrics["max_nis_prediction_gap_s"] = MAX_NIS_PREDICTION_GAP_S
-    metrics["process_acceleration_std_mps2"] = PROCESS_ACCELERATION_STD_MPS2
+    metrics["process_noise_intensity"] = PROCESS_NOISE_INTENSITY
+    metrics["initial_covariance_diag"] = np.diag(INITIAL_STATE_COVARIANCE).tolist()
+    metrics["measurement_noise_diag"] = np.diag(SENSOR_MEASUREMENT_COVARIANCE).tolist()
+    metrics["cpm_association_noise_diag"] = np.diag(CPM_ASSOCIATION_COVARIANCE).tolist()
+    metrics["process_noise_model"] = "continuous_white_acceleration"
     metrics["total_messages"] = int(len(evaluated_results))
     metrics["cam_messages"] = int((results["message_type"] == "CAM").sum())
     metrics["cpm_messages"] = int((results["message_type"] == "CPM").sum())
+    metrics["evaluated_receivers"] = len(receiver_ids)
+    metrics["excluded_attacker_receivers"] = len(all_receiver_ids) - len(receiver_ids)
+    metrics["catch_enabled"] = catch_enabled
     return metrics, results
 
 

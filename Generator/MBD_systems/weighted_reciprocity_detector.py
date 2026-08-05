@@ -106,8 +106,8 @@ def maintained_trust_pair_score(inbound, outbound):
 
 
 class WeightedReciprocityDetector(CamCpmKalmanDetector):
-    def __init__(self, catch_params=None):
-        super().__init__(catch_params)
+    def __init__(self, catch_params=None, catch_enabled=True):
+        super().__init__(catch_params, catch_enabled)
         self.current_bucket = None
         self.bucket_edges = {}
         self.track_ids = {}
@@ -336,9 +336,11 @@ class WeightedReciprocityDetector(CamCpmKalmanDetector):
         }
 
 
-def process_weighted_reciprocity_folder(input_folder: Path, catch_params):
+def process_weighted_reciprocity_folder(
+    input_folder: Path, catch_params, catch_enabled=True,
+):
     metrics, results = process_cam_cpm_kalman_folder(
-        input_folder, catch_params, WeightedReciprocityDetector
+        input_folder, catch_params, WeightedReciprocityDetector, catch_enabled
     )
     metrics["reciprocity_nis_threshold"] = RECIPROCITY_NIS_THRESHOLD
     return metrics, results
@@ -419,9 +421,12 @@ class MaintainedTrustReciprocityDetector(WeightedReciprocityDetector):
         return maintained_trust_pair_score(inbound, outbound)
 
 
-def process_maintained_trust_reciprocity_folder(input_folder: Path, catch_params):
+def process_maintained_trust_reciprocity_folder(
+    input_folder: Path, catch_params, catch_enabled=True,
+):
     metrics, results = process_cam_cpm_kalman_folder(
-        input_folder, catch_params, MaintainedTrustReciprocityDetector
+        input_folder, catch_params, MaintainedTrustReciprocityDetector,
+        catch_enabled,
     )
     metrics["reciprocity_nis_threshold"] = RECIPROCITY_NIS_THRESHOLD
     return metrics, results
@@ -434,9 +439,12 @@ class NoAnonymousMaintainedTrustDetector(MaintainedTrustReciprocityDetector):
         return False
 
 
-def process_no_anonymous_maintained_trust_folder(input_folder: Path, catch_params):
+def process_no_anonymous_maintained_trust_folder(
+    input_folder: Path, catch_params, catch_enabled=True,
+):
     metrics, results = process_cam_cpm_kalman_folder(
-        input_folder, catch_params, NoAnonymousMaintainedTrustDetector
+        input_folder, catch_params, NoAnonymousMaintainedTrustDetector,
+        catch_enabled,
     )
     metrics["reciprocity_nis_threshold"] = RECIPROCITY_NIS_THRESHOLD
     return metrics, results

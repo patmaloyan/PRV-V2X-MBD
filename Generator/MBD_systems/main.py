@@ -10,7 +10,7 @@ import pandas as pd
 
 from data_structures import Parameters
 from catch_profiles import load_catch_profile
-from cpm_enhanced_detector import process_cpm_enhanced_folder
+from cpm_enhanced_detector import process_two_edge_reciprocity_folder
 from kalman_detector import (
     evaluation_receiver_ids,
     process_cam_cpm_kalman_folder,
@@ -101,13 +101,13 @@ def add_catch_output(aggregated_metrics, metrics, profile, params):
         "cpm_association_noise_diag"
     ]
     aggregated_metrics["process_noise_model"] = metrics["process_noise_model"]
-    aggregated_metrics["catch_profile"] = profile
+    aggregated_metrics["catch_profile"] = profile if metrics["catch_enabled"] else None
     aggregated_metrics["catch_metrics"] = metrics["catch_metrics"]
     aggregated_metrics["catch_check_activations"] = metrics["catch_check_activations"]
     aggregated_metrics["kalman_skipped"] = metrics["kalman_skipped"]
-    aggregated_metrics["parameters"] = vars(params)
+    aggregated_metrics["parameters"] = vars(params) if metrics["catch_enabled"] else None
     aggregated_metrics["position_plausibility_check_enabled"] = (
-        params.POSITION_PLAUSIBILITY_ENABLED
+        params.POSITION_PLAUSIBILITY_ENABLED if metrics["catch_enabled"] else None
     )
 
 
@@ -124,8 +124,8 @@ def main():
     parser.add_argument(
         "--type",
         type=int,
-        choices=[*range(8), 20, 100],
-        help="0 = catch-checks, 1 = legacy checks, 2 = CAM-only Kalman, 3 = CAM+CPM Kalman, 4 = reciprocal CPM Kalman, 5 = two-edge reciprocal CPM Kalman, 6 = three-score average reciprocity, 7 = maintained-trust reciprocity, 20 = maintained trust without anonymous CPM tracks, 100 = alias-aware catch",
+        choices=[*range(7), 20, 100],
+        help="0 = catch-checks, 1 = legacy checks, 2 = CAM-only Kalman, 3 = CAM+CPM Kalman, 4 = two-edge reciprocal CPM Kalman, 5 = three-score average reciprocity, 6 = maintained-trust reciprocity, 20 = maintained trust without anonymous CPM tracks, 100 = alias-aware catch",
         required=True,
     )
     parser.add_argument(
@@ -168,7 +168,7 @@ def main():
     catch_enabled = not args.no_catch
 
     # Parameter Setup
-    if int(args.type) in (0, 2, 3, 4, 5, 6, 7, 20, 100) and args.train != 1:
+    if int(args.type) in (0, 2, 3, 4, 5, 6, 20, 100) and args.train != 1:
         params = load_catch_profile(args.catch_profile)
     elif args.train == 1:
         params = Parameters(MAX_PLAUSIBLE_RANGE=args.mpr,
@@ -226,8 +226,9 @@ def main():
         aggregated_metrics = evaluate_predictions(scenario_stats)
         for key in [
             "wireless_range_m", "range_margin_m", "nis_threshold",
-            "max_nis_prediction_gap_s", "process_noise_intensity",
-            "known_alias_nis_threshold",
+            "process_noise_intensity",
+            "known_alias_nis_threshold", "max_kalman_prediction_gap_s",
+            "max_association_prediction_gap_s",
             "total_messages", "evaluated_receivers", "excluded_attacker_receivers",
         ]:
             aggregated_metrics[key] = metrics.get(key)
@@ -257,7 +258,8 @@ def main():
         aggregated_metrics = evaluate_predictions(scenario_stats)
         for key in [
             "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
-            "nis_threshold", "known_alias_nis_threshold", "max_nis_prediction_gap_s",
+            "nis_threshold", "known_alias_nis_threshold",
+            "max_kalman_prediction_gap_s", "max_association_prediction_gap_s",
             "process_noise_intensity",
             "total_messages", "cam_messages", "cpm_messages",
             "evaluated_receivers", "excluded_attacker_receivers",
@@ -280,46 +282,15 @@ def main():
         return
 
     if int(args.type) == 4:
-        metrics, debug_results = process_cpm_enhanced_folder(
-            input_folder, params, required_unreciprocated_edges=1,
-            catch_enabled=catch_enabled,
+        metrics, debug_results = process_two_edge_reciprocity_folder(
+            input_folder, params, catch_enabled,
         )
         scenario_stats.append(metrics)
         aggregated_metrics = evaluate_predictions(scenario_stats)
         for key in [
             "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
-            "nis_threshold", "known_alias_nis_threshold", "max_nis_prediction_gap_s",
-            "process_noise_intensity",
-            "total_messages", "cam_messages", "cpm_messages",
-            "evaluated_receivers", "excluded_attacker_receivers",
-        ]:
-            aggregated_metrics[key] = metrics.get(key)
-        add_catch_output(aggregated_metrics, metrics, args.catch_profile, params)
-        print(aggregated_metrics['f1'])
-
-        if args.train == 0:
-            result_name = "kalman_cam_cpm_enhanced" + ("" if catch_enabled else "_no_catch")
-            output_dir = result_directory(input_folder, result_name)
-            output_file = output_dir / "predicted.json"
-            debug_file = output_dir / "debug.json"
-            print(f"Saved in {output_file}")
-            with open(output_file, 'w') as f:
-                json.dump(aggregated_metrics, f, indent=4)
-            with open(debug_file, 'w') as f:
-                json.dump(debug_results.where(pd.notnull(debug_results), None).to_dict(orient='records'), f, indent=4)
-            print(f"Saved debug in {debug_file}")
-        return
-
-    if int(args.type) == 5:
-        metrics, debug_results = process_cpm_enhanced_folder(
-            input_folder, params, required_unreciprocated_edges=2,
-            catch_enabled=catch_enabled,
-        )
-        scenario_stats.append(metrics)
-        aggregated_metrics = evaluate_predictions(scenario_stats)
-        for key in [
-            "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
-            "nis_threshold", "known_alias_nis_threshold", "max_nis_prediction_gap_s",
+            "nis_threshold", "known_alias_nis_threshold",
+            "max_kalman_prediction_gap_s", "max_association_prediction_gap_s",
             "process_noise_intensity",
             "total_messages", "cam_messages", "cpm_messages",
             "evaluated_receivers", "excluded_attacker_receivers",
@@ -341,7 +312,7 @@ def main():
             print(f"Saved debug in {debug_file}")
         return
 
-    if int(args.type) == 6:
+    if int(args.type) == 5:
         metrics, debug_results = process_weighted_reciprocity_folder(
             input_folder, params, catch_enabled
         )
@@ -349,7 +320,8 @@ def main():
         aggregated_metrics = evaluate_predictions(scenario_stats)
         for key in [
             "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
-            "nis_threshold", "known_alias_nis_threshold", "max_nis_prediction_gap_s",
+            "nis_threshold", "known_alias_nis_threshold",
+            "max_kalman_prediction_gap_s", "max_association_prediction_gap_s",
             "reciprocity_nis_threshold",
             "process_noise_intensity",
             "total_messages", "cam_messages", "cpm_messages",
@@ -379,7 +351,7 @@ def main():
             print(f"Saved debug in {debug_file}")
         return
 
-    if int(args.type) == 7:
+    if int(args.type) == 6:
         metrics, debug_results = process_maintained_trust_reciprocity_folder(
             input_folder, params, catch_enabled
         )
@@ -387,7 +359,8 @@ def main():
         aggregated_metrics = evaluate_predictions(scenario_stats)
         for key in [
             "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
-            "nis_threshold", "known_alias_nis_threshold", "max_nis_prediction_gap_s",
+            "nis_threshold", "known_alias_nis_threshold",
+            "max_kalman_prediction_gap_s", "max_association_prediction_gap_s",
             "reciprocity_nis_threshold",
             "process_noise_intensity",
             "total_messages", "cam_messages", "cpm_messages",
@@ -425,7 +398,8 @@ def main():
         aggregated_metrics = evaluate_predictions(scenario_stats)
         for key in [
             "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
-            "nis_threshold", "known_alias_nis_threshold", "max_nis_prediction_gap_s",
+            "nis_threshold", "known_alias_nis_threshold",
+            "max_kalman_prediction_gap_s", "max_association_prediction_gap_s",
             "reciprocity_nis_threshold",
             "process_noise_intensity",
             "total_messages", "cam_messages", "cpm_messages",

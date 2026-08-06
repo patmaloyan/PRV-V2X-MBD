@@ -24,15 +24,20 @@ EGO_OBJECT_POSITION_THRESHOLD_M = 10
 EGO_OBJECT_SPEED_THRESHOLD_MPS = 5
 # 99% chi-square threshold for the four measured values [x, y, vx, vy].
 NIS_THRESHOLD = 13.28
-# Use the same 99% four-dimensional NIS threshold for established tracks.
-KNOWN_ALIAS_NIS_THRESHOLD = NIS_THRESHOLD
-# F2MD resets a Kalman filter when its last update is this old.
-MAX_NIS_PREDICTION_GAP_S = 3.1
-MAX_NIS_PREDICTION_GAP_NS = int(MAX_NIS_PREDICTION_GAP_S * 1_000_000_000)
-RANGE_MARGIN_M = 50.0
+# 97.5% chi-square threshold for established four-dimensional tracks.
+KNOWN_ALIAS_NIS_THRESHOLD = 11.14
+MAX_KALMAN_PREDICTION_GAP_S = 4.1
+MAX_KALMAN_PREDICTION_GAP_NS = int(
+    MAX_KALMAN_PREDICTION_GAP_S * 1_000_000_000
+)
+MAX_ASSOCIATION_PREDICTION_GAP_S = 3.1
+MAX_ASSOCIATION_PREDICTION_GAP_NS = int(
+    MAX_ASSOCIATION_PREDICTION_GAP_S * 1_000_000_000
+)
+RANGE_MARGIN_M = 25.0
 EGO_LOOKBACK_NS = 2_000_000_000
 CPM_SENSOR_RANGE_M = 80.0
-PSEUDONYM_INTERVAL_S = 20
+PSEUDONYM_INTERVAL_S = 50
 TRACK_EXPIRY_NS = PSEUDONYM_INTERVAL_S * 1_000_000_000
 
 
@@ -60,6 +65,28 @@ class CamOnlyKalmanDetector:
 
     def catch_messages(self, messages):
         if self.catch_enabled:
+            message_types = messages.get("message_type")
+            if message_types is not None and (message_types == "CPM").any():
+                cams = messages[message_types == "CAM"].copy()
+                checked_cams = apply_catch_gate(cams, self.catch_params)
+                catch_by_pair = {
+                    sender_pair_key(row): (
+                        int(row["catch_prediction"]), row["catch_failed_checks"]
+                    )
+                    for row in checked_cams.to_dict(orient="records")
+                }
+                checked = messages.reset_index(drop=True).copy()
+                predictions = []
+                failed_checks = []
+                for row in checked.to_dict(orient="records"):
+                    catch_result = catch_by_pair.get(sender_pair_key(row))
+                    if str(row.get("message_type", "CAM")).upper() == "CPM":
+                        catch_result = catch_result or (1, ["missing_paired_cam"])
+                    predictions.append(catch_result[0])
+                    failed_checks.append(catch_result[1])
+                checked["catch_prediction"] = predictions
+                checked["catch_failed_checks"] = failed_checks
+                return checked
             return apply_catch_gate(messages, self.catch_params)
         messages = messages.reset_index(drop=True).copy()
         messages["catch_prediction"] = 0
@@ -136,12 +163,14 @@ class CamOnlyKalmanDetector:
             return None
 
         deviation = track.deviation_against_cam(cam, self.measurement_noise)
-        if not nis_prediction_is_fresh(track, int(cam["rcvTime"])):
-            if commit:
-                track.reset_from_cam(cam, self.initial_covariance)
+        if (
+            int(cam["rcvTime"]) - track.last_update_time
+            >= MAX_KALMAN_PREDICTION_GAP_NS
+        ):
             return decision(
-                True, "known_alias_stale_reset_accept", deviation.position_error,
+                False, "known_alias_stale_reject", deviation.position_error,
                 deviation.speed_error, track.station_alias, deviation.nis,
+                KNOWN_ALIAS_NIS_THRESHOLD,
             )
 
         if nis_within_threshold(deviation.nis, KNOWN_ALIAS_NIS_THRESHOLD):
@@ -150,11 +179,13 @@ class CamOnlyKalmanDetector:
             return decision(
                 True, "known_alias_accept", deviation.position_error,
                 deviation.speed_error, track.station_alias, deviation.nis,
+                KNOWN_ALIAS_NIS_THRESHOLD,
             )
 
         return decision(
             False, "known_alias_reject", deviation.position_error,
             deviation.speed_error, track.station_alias, deviation.nis,
+            KNOWN_ALIAS_NIS_THRESHOLD,
         )
 
     def pseudonym_change_check(self, cam: dict, commit: bool = True):
@@ -165,7 +196,7 @@ class CamOnlyKalmanDetector:
         best_score = float("inf")
 
         for track in self.tracks:
-            if not nis_prediction_is_fresh(track, int(cam["rcvTime"])):
+            if not association_prediction_is_fresh(track, int(cam["rcvTime"])):
                 continue
             deviation = track.deviation_against_cam(cam, self.measurement_noise)
             score = deviation.nis
@@ -176,7 +207,9 @@ class CamOnlyKalmanDetector:
                 best_nis = deviation.nis
                 best_score = score
 
-        if best_track is None or not nis_within_threshold(best_nis):
+        if best_track is None or not nis_within_threshold(
+            best_nis, KNOWN_ALIAS_NIS_THRESHOLD
+        ):
             return None
 
         old_station_alias = best_track.station_alias
@@ -187,7 +220,7 @@ class CamOnlyKalmanDetector:
             best_track.update_from_cam(cam, self.measurement_noise)
         return decision(
             True, "pseudonym_accept", best_pos_error, best_speed_error,
-            old_station_alias, best_nis,
+            old_station_alias, best_nis, KNOWN_ALIAS_NIS_THRESHOLD,
         )
 
     def new_vehicle_check(
@@ -286,9 +319,14 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
 
     def perceived_object_matches(self, measurement):
         best_track, deviation = self.closest_track(measurement)
-        if best_track is not None and nis_within_threshold(deviation.nis):
+        if best_track is not None and nis_within_threshold(
+            deviation.nis, self.perceived_object_nis_threshold()
+        ):
             return [(best_track, deviation)]
         return []
+
+    def perceived_object_nis_threshold(self):
+        return NIS_THRESHOLD
 
     def process_receiver(self, cam_path: Path | None, cpm_path: Path | None, ego_path: Path | None):
         # CAMs and CPMs received by this vehicle share one chronological track history.
@@ -297,23 +335,37 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
         receiver_id = (cam_path or cpm_path).stem
 
         rows = []
+        paired_source_decisions = {}
         for message in messages.to_dict(orient="records"):
             message_type = str(message["message_type"]).upper()
-            catch_prediction = int(message["catch_prediction"])
-            if catch_prediction:
-                source_decision = self.catch_rejection()
-            else:
-                self.prepare_tracks_for_message(message)
-                # Type 4 can reject before Kalman state is changed; type 3 returns None here.
-                source_decision = self.pre_source_decision(message)
+            pair_key = sender_pair_key(message)
+            if message_type == "CPM":
+                source_decision = paired_source_decisions.get(pair_key)
                 if source_decision is None:
-                    source_decision = self.process_cam(message, ego_snapshots)
+                    source_decision = decision(
+                        False, "missing_paired_cam", None, None, None
+                    )
+                else:
+                    source_decision = dict(source_decision)
+            else:
+                catch_prediction = int(message["catch_prediction"])
+                if catch_prediction:
+                    source_decision = self.catch_rejection()
+                else:
+                    self.prepare_tracks_for_message(message)
+                    # Type 4 can reject before Kalman state is changed; type 3 returns None here.
+                    source_decision = self.pre_source_decision(message)
+                    if source_decision is None:
+                        source_decision = self.process_cam(message, ego_snapshots)
+                paired_source_decisions[pair_key] = dict(source_decision)
             object_counts = empty_object_counts()
             if message_type == "CPM":
                 perceived_objects = message.get("perceivedObjects", [])
                 # The orange flowchart branch runs only after the CPM source is accepted.
                 if source_decision["accepted"]:
-                    object_counts = self.process_perceived_objects(message)
+                    object_counts = self.process_perceived_objects(
+                        cpm_object_message(message)
+                    )
                 elif isinstance(perceived_objects, list):
                     # Count skipped objects so debug totals still reconcile with raw CPM data.
                     object_counts["cpm_objects_observed"] = len(perceived_objects)
@@ -321,6 +373,10 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
                 else:
                     object_counts["cpm_objects_malformed"] = 1
 
+            gate_fields = self.catch_debug(message, source_decision)
+            if message_type == "CPM":
+                gate_fields["kalman_skipped"] = True
+                gate_fields["kalman_prediction"] = None
             rows.append({
                 "receiver_id": receiver_id,
                 "message_type": message_type,
@@ -334,7 +390,7 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
                 "attacker": int(message.get("attacker", 0)),
                 "prediction": 0 if source_decision["accepted"] else 1,
                 **source_decision,
-                **self.catch_debug(message, source_decision),
+                **gate_fields,
                 **object_counts,
                 **self.message_debug(),
             })
@@ -382,7 +438,11 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
                     "pos_error": best_deviation.position_error,
                     "speed_error": best_deviation.speed_error,
                     "nis": best_deviation.nis,
-                    "normalized_nis": best_deviation.nis / NIS_THRESHOLD,
+                    "nis_threshold": self.perceived_object_nis_threshold(),
+                    "normalized_nis": (
+                        best_deviation.nis
+                        / self.perceived_object_nis_threshold()
+                    ),
                 }
                 if len(edge_results) == 1:
                     event.update(edge_results[0])
@@ -411,7 +471,9 @@ class CamCpmKalmanDetector(CamOnlyKalmanDetector):
         best_deviation = None
         best_score = float("inf")
         for track in self.tracks:
-            if not nis_prediction_is_fresh(track, int(measurement["rcvTime"])):
+            if not association_prediction_is_fresh(
+                track, int(measurement["rcvTime"])
+            ):
                 continue
             deviation = track.deviation_against_cam(
                 measurement, self.cpm_association_noise
@@ -454,7 +516,8 @@ def process_kalman_folder(
     metrics["range_margin_m"] = RANGE_MARGIN_M
     metrics["nis_threshold"] = NIS_THRESHOLD
     metrics["known_alias_nis_threshold"] = KNOWN_ALIAS_NIS_THRESHOLD
-    metrics["max_nis_prediction_gap_s"] = MAX_NIS_PREDICTION_GAP_S
+    metrics["max_kalman_prediction_gap_s"] = MAX_KALMAN_PREDICTION_GAP_S
+    metrics["max_association_prediction_gap_s"] = MAX_ASSOCIATION_PREDICTION_GAP_S
     metrics["process_noise_intensity"] = PROCESS_NOISE_INTENSITY
     metrics["initial_covariance_diag"] = np.diag(INITIAL_STATE_COVARIANCE).tolist()
     metrics["measurement_noise_diag"] = np.diag(SENSOR_MEASUREMENT_COVARIANCE).tolist()
@@ -506,7 +569,8 @@ def process_cam_cpm_kalman_folder(
     metrics["cpm_sensor_range_m"] = CPM_SENSOR_RANGE_M
     metrics["nis_threshold"] = NIS_THRESHOLD
     metrics["known_alias_nis_threshold"] = KNOWN_ALIAS_NIS_THRESHOLD
-    metrics["max_nis_prediction_gap_s"] = MAX_NIS_PREDICTION_GAP_S
+    metrics["max_kalman_prediction_gap_s"] = MAX_KALMAN_PREDICTION_GAP_S
+    metrics["max_association_prediction_gap_s"] = MAX_ASSOCIATION_PREDICTION_GAP_S
     metrics["process_noise_intensity"] = PROCESS_NOISE_INTENSITY
     metrics["initial_covariance_diag"] = np.diag(INITIAL_STATE_COVARIANCE).tolist()
     metrics["measurement_noise_diag"] = np.diag(SENSOR_MEASUREMENT_COVARIANCE).tolist()
@@ -533,10 +597,40 @@ def combined_message_frame(cam_path: Path | None, cpm_path: Path | None):
     frame = pd.DataFrame(records)
     frame["rcvTime"] = frame["rcvTime"].astype("int64")
     frame["sendTime"] = frame["sendTime"].astype("int64")
-    # Stable secondary keys make equal-reception-time processing reproducible.
+    cam_receive_times = {
+        sender_pair_key(row): int(row["rcvTime"])
+        for row in frame[frame["message_type"] == "CAM"].to_dict(orient="records")
+    }
+    effective_times = []
+    paired_cams = []
+    for row in frame.to_dict(orient="records"):
+        paired_cam_time = cam_receive_times.get(sender_pair_key(row))
+        is_paired_cpm = row["message_type"] == "CPM" and paired_cam_time is not None
+        paired_cams.append(is_paired_cpm)
+        effective_times.append(
+            max(int(row["rcvTime"]), paired_cam_time)
+            if is_paired_cpm else int(row["rcvTime"])
+        )
+    frame["paired_cam"] = paired_cams
+    frame["effectiveRcvTime"] = effective_times
+    frame["message_type_order"] = frame["message_type"].map({"CAM": 0, "CPM": 1})
+    # Buffer an early CPM until its matching CAM arrives, then process CAM first.
     return frame.sort_values(
-        ["rcvTime", "sendTime", "messageID"], kind="mergesort", ignore_index=True
+        ["effectiveRcvTime", "sendTime", "message_type_order", "messageID"],
+        kind="mergesort", ignore_index=True,
+    ).drop(columns=["message_type_order"])
+
+
+def sender_pair_key(message: dict):
+    return int(message.get("sender_alias", 0)), int(message.get("sendTime", 0))
+
+
+def cpm_object_message(message: dict):
+    effective = dict(message)
+    effective["rcvTime"] = int(
+        message.get("effectiveRcvTime", message.get("rcvTime", 0))
     )
+    return effective
 
 
 def relative_perceived_object_state(perceived_object: dict, reference: dict):
@@ -663,9 +757,8 @@ def nis_within_threshold(nis, threshold=NIS_THRESHOLD):
     return nis <= threshold
 
 
-def nis_prediction_is_fresh(track, time_ns):
-    # last_update_time is the timestamp underlying the predicted state/covariance.
-    return int(time_ns) - track.last_update_time < MAX_NIS_PREDICTION_GAP_NS
+def association_prediction_is_fresh(track, time_ns):
+    return int(time_ns) - track.last_update_time < MAX_ASSOCIATION_PREDICTION_GAP_NS
 
 
 def ego_errors_within_threshold(pos_error, speed_error):
@@ -687,7 +780,8 @@ def receiver_just_entered(cam: dict):
 
 
 def decision(
-    accepted: bool, reason: str, pos_error, speed_error, matched_id, nis=None
+    accepted: bool, reason: str, pos_error, speed_error, matched_id, nis=None,
+    nis_threshold=NIS_THRESHOLD,
 ):
     return {
         "accepted": accepted,
@@ -695,6 +789,7 @@ def decision(
         "pos_error": pos_error,
         "speed_error": speed_error,
         "nis": nis,
-        "normalized_nis": nis / NIS_THRESHOLD if nis is not None else None,
+        "nis_threshold": nis_threshold if nis is not None else None,
+        "normalized_nis": nis / nis_threshold if nis is not None else None,
         "matched_id": matched_id,
     }

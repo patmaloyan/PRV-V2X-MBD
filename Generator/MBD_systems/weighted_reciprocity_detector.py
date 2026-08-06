@@ -12,6 +12,7 @@ from kalman_detector import (
     CPM_SENSOR_RANGE_M,
     CamCpmKalmanDetector,
     combined_message_frame,
+    cpm_object_message,
     decision,
     empty_object_counts,
     load_json_list,
@@ -19,6 +20,7 @@ from kalman_detector import (
     process_cam_cpm_kalman_folder,
     receiver_just_entered,
     sender_just_entered,
+    sender_pair_key,
 )
 
 
@@ -27,6 +29,7 @@ SCORE_HISTORY_LENGTH = 3
 RECIPROCITY_BOTH_DIRECTIONS_COEFFICIENT = 2.0
 RECIPROCITY_INBOUND_ONLY_COEFFICIENT = 1.0
 RECIPROCITY_OUTBOUND_ONLY_COEFFICIENT = -2.0
+MAINTAINED_TRUST_OUTBOUND_ONLY_COEFFICIENT = -1.0
 TRUST_ALPHA = 1.0 / 3.0
 MAX_PAIR_SCORE_MAGNITUDE = 2.0
 RECIPROCITY_NIS_THRESHOLD = 18.47
@@ -93,7 +96,7 @@ def pair_score(inbound, outbound):
 
 
 def maintained_trust_pair_score(inbound, outbound):
-    """Type 7/20 score; the outbound-only penalty uses w_AB directly."""
+    """Type 6/20 score; the outbound-only penalty uses w_AB directly."""
     if inbound is not None and outbound is not None:
         return RECIPROCITY_BOTH_DIRECTIONS_COEFFICIENT * math.sqrt(
             inbound.weight * outbound.weight
@@ -101,7 +104,7 @@ def maintained_trust_pair_score(inbound, outbound):
     if inbound is not None:
         return RECIPROCITY_INBOUND_ONLY_COEFFICIENT * inbound.weight
     if outbound is not None:
-        return RECIPROCITY_OUTBOUND_ONLY_COEFFICIENT * outbound.weight
+        return MAINTAINED_TRUST_OUTBOUND_ONLY_COEFFICIENT * outbound.weight
     return 0.0
 
 
@@ -120,10 +123,13 @@ class WeightedReciprocityDetector(CamCpmKalmanDetector):
         best_track, deviation = self.closest_track(measurement)
         if (
             best_track is not None
-            and deviation.nis <= RECIPROCITY_NIS_THRESHOLD
+            and deviation.nis <= self.perceived_object_nis_threshold()
         ):
             return [(best_track, deviation)]
         return []
+
+    def perceived_object_nis_threshold(self):
+        return RECIPROCITY_NIS_THRESHOLD
 
     def track_id(self, track, create_trust=False):
         key = id(track)
@@ -200,64 +206,88 @@ class WeightedReciprocityDetector(CamCpmKalmanDetector):
         )
         receiver_id = (cam_path or cpm_path).stem
         rows = []
+        paired_source_decisions = {}
 
         for message in messages.to_dict(orient="records"):
             message_type = str(message["message_type"]).upper()
-            catch_prediction = int(message["catch_prediction"])
+            pair_key = sender_pair_key(message)
             source_state = None
             self.current_source_track_id = None
-            if catch_prediction:
-                base_decision = None
-                source_decision = self.catch_rejection()
-            else:
-                self.advance_to(message["rcvTime"])
-                base_decision = self.process_cam(
-                    message, ego_snapshots, commit=False
-                )
-                source_track = self.tracks_by_station_alias.get(
-                    int(message.get("sender_alias", 0))
-                )
-                if (
-                    source_track is None
-                    and base_decision["reason"] == "pseudonym_accept"
-                ):
-                    source_track = self.tracks_by_station_alias.get(
-                        int(base_decision["matched_id"])
+            if message_type == "CPM":
+                cached = paired_source_decisions.get(pair_key)
+                self.advance_to(message.get("effectiveRcvTime", message["rcvTime"]))
+                if cached is None:
+                    base_decision = None
+                    source_decision = decision(
+                        False, "missing_paired_cam", None, None, None
                     )
-                if source_track is not None:
-                    self.current_source_track_id = self.track_ids.get(
-                        id(source_track)
-                    )
+                else:
+                    source_decision = dict(cached["source_decision"])
+                    base_decision = cached["base_decision"]
+                    self.current_source_track_id = cached["source_track_id"]
                     source_state = self.trust.get(self.current_source_track_id)
-
-                externally_accepted = base_decision["accepted"] and (
-                    source_state is None or source_state.accepted
-                )
-                source_decision = dict(base_decision)
-                if externally_accepted:
-                    source_decision = self.process_cam(
-                        message, ego_snapshots, commit=True
+            else:
+                catch_prediction = int(message["catch_prediction"])
+                if catch_prediction:
+                    base_decision = None
+                    source_decision = self.catch_rejection()
+                else:
+                    self.advance_to(message["rcvTime"])
+                    base_decision = self.process_cam(
+                        message, ego_snapshots, commit=False
                     )
                     source_track = self.tracks_by_station_alias.get(
                         int(message.get("sender_alias", 0))
                     )
-                    if source_track is not None:
-                        self.current_source_track_id = self.track_id(
-                            source_track, create_trust=True
+                    if (
+                        source_track is None
+                        and base_decision["reason"] == "pseudonym_accept"
+                    ):
+                        source_track = self.tracks_by_station_alias.get(
+                            int(base_decision["matched_id"])
                         )
-                        source_state = self.trust[self.current_source_track_id]
-                elif base_decision["accepted"]:
-                    source_decision.update(decision(
-                        False, "weighted_reciprocity_quarantine",
-                        base_decision.get("pos_error"),
-                        base_decision.get("speed_error"),
-                        base_decision.get("matched_id"), base_decision.get("nis"),
-                    ))
+                    if source_track is not None:
+                        self.current_source_track_id = self.track_ids.get(
+                            id(source_track)
+                        )
+                        source_state = self.trust.get(self.current_source_track_id)
+
+                    externally_accepted = base_decision["accepted"] and (
+                        source_state is None or source_state.accepted
+                    )
+                    source_decision = dict(base_decision)
+                    if externally_accepted:
+                        source_decision = self.process_cam(
+                            message, ego_snapshots, commit=True
+                        )
+                        source_track = self.tracks_by_station_alias.get(
+                            int(message.get("sender_alias", 0))
+                        )
+                        if source_track is not None:
+                            self.current_source_track_id = self.track_id(
+                                source_track, create_trust=True
+                            )
+                            source_state = self.trust[self.current_source_track_id]
+                    elif base_decision["accepted"]:
+                        source_decision.update(decision(
+                            False, "weighted_reciprocity_quarantine",
+                            base_decision.get("pos_error"),
+                            base_decision.get("speed_error"),
+                            base_decision.get("matched_id"), base_decision.get("nis"),
+                            base_decision.get("nis_threshold"),
+                        ))
+                paired_source_decisions[pair_key] = {
+                    "source_decision": dict(source_decision),
+                    "base_decision": dict(base_decision) if base_decision else None,
+                    "source_track_id": self.current_source_track_id,
+                }
 
             object_counts = empty_object_counts()
             if message_type == "CPM":
                 if source_decision["accepted"]:
-                    object_counts = self.process_perceived_objects(message)
+                    object_counts = self.process_perceived_objects(
+                        cpm_object_message(message)
+                    )
                 else:
                     objects = message.get("perceivedObjects", [])
                     if isinstance(objects, list):
@@ -266,6 +296,12 @@ class WeightedReciprocityDetector(CamCpmKalmanDetector):
                     else:
                         object_counts["cpm_objects_malformed"] = 1
 
+            gate_fields = self.catch_debug(
+                message, base_decision or source_decision
+            )
+            if message_type == "CPM":
+                gate_fields["kalman_skipped"] = True
+                gate_fields["kalman_prediction"] = None
             rows.append({
                 "receiver_id": receiver_id,
                 "message_type": message_type,
@@ -279,7 +315,7 @@ class WeightedReciprocityDetector(CamCpmKalmanDetector):
                 "attacker": int(message.get("attacker", 0)),
                 "prediction": 0 if source_decision["accepted"] else 1,
                 **source_decision,
-                **self.catch_debug(message, base_decision or source_decision),
+                **gate_fields,
                 **object_counts,
                 "reciprocity_bucket": self.current_bucket,
                 "reciprocity_track_id": self.current_source_track_id,
@@ -347,7 +383,7 @@ def process_weighted_reciprocity_folder(
 
 
 class MaintainedTrustReciprocityDetector(WeightedReciprocityDetector):
-    """Type 7: EWMA trust over normalized one-second reciprocity evidence."""
+    """Type 6: EWMA trust over normalized one-second reciprocity evidence."""
 
     def track_id(self, track, create_trust=False):
         key = id(track)

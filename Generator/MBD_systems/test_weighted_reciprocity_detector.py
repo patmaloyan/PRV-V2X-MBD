@@ -88,7 +88,7 @@ class WeightedReciprocityMathTests(unittest.TestCase):
         outbound = EdgeEvidence(0.0, 0.0, 1.0, 0.5, 0.25)
 
         self.assertEqual(pair_score(None, outbound), -0.25)
-        self.assertEqual(maintained_trust_pair_score(None, outbound), -0.5)
+        self.assertEqual(maintained_trust_pair_score(None, outbound), -0.25)
 
     def test_edge_weight_combines_distance_and_confidence(self):
         evidence = edge_evidence(
@@ -101,6 +101,9 @@ class WeightedReciprocityMathTests(unittest.TestCase):
 
     def test_reciprocity_matching_uses_its_own_threshold(self):
         detector = WeightedReciprocityDetector()
+        self.assertEqual(
+            detector.perceived_object_nis_threshold(), RECIPROCITY_NIS_THRESHOLD
+        )
         track = object()
         detector.closest_track = lambda measurement: (
             track,
@@ -148,7 +151,7 @@ class FinalDecisionCommitTests(unittest.TestCase):
         initial_state = track.filter.x.copy()
 
         result = process_source(
-            detector, "CAM", source_message(position=10.0, rcv_time=1),
+            detector, "CAM", source_message(position=5.0, rcv_time=1),
         )
 
         self.assertEqual(result["reason"], "weighted_reciprocity_quarantine")
@@ -156,7 +159,7 @@ class FinalDecisionCommitTests(unittest.TestCase):
         self.assertEqual(track.last_update_time, 0)
         self.assertTrue((track.filter.x == initial_state).all())
 
-    def test_quarantine_does_not_reset_stale_track(self):
+    def test_quarantine_does_not_update_long_gap_track(self):
         detector, track = self.quarantined_detector()
 
         result = process_source(
@@ -185,7 +188,7 @@ class FinalDecisionCommitTests(unittest.TestCase):
             detector, "CPM", source_message("CPM", rcv_time=1),
         )
 
-        self.assertEqual(result["reason"], "weighted_reciprocity_quarantine")
+        self.assertEqual(result["reason"], "missing_paired_cam")
         self.assertEqual(detector.object_calls, 0)
         self.assertEqual(track.last_update_time, 0)
 
@@ -194,7 +197,7 @@ class FinalDecisionCommitTests(unittest.TestCase):
         detector.trust[detector.track_ids[id(track)]].accepted = True
 
         result = process_source(
-            detector, "CAM", source_message(position=10.0, rcv_time=1),
+            detector, "CAM", source_message(position=5.0, rcv_time=1),
         )
 
         self.assertTrue(result["accepted"])
@@ -243,8 +246,8 @@ class MaintainedTrustStateTests(unittest.TestCase):
         result = self.detector.close_current_bucket()
 
         self.assertEqual(result["evidence_counts"][1], 1)
-        self.assertEqual(result["normalized_scores"][1], -1.0)
-        self.assertAlmostEqual(self.detector.trust[1].score, -1.0 / 3.0)
+        self.assertEqual(result["normalized_scores"][1], -0.5)
+        self.assertAlmostEqual(self.detector.trust[1].score, -1.0 / 6.0)
         self.assertFalse(self.detector.trust[1].accepted)
 
     def test_no_evidence_does_not_change_trust_or_state(self):

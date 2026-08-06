@@ -1,11 +1,11 @@
-"""Type 4: type 3 plus reciprocal CPM perception checks."""
+"""Type 4: type 3 plus a two-edge reciprocal CPM check."""
 
 from pathlib import Path
 
 from kalman_detector import (
     CamCpmKalmanDetector,
+    association_prediction_is_fresh,
     decision,
-    nis_prediction_is_fresh,
     nis_within_threshold,
     process_cam_cpm_kalman_folder,
 )
@@ -13,6 +13,7 @@ from kalman_detector import (
 
 EDGE_GRACE_NS = 2_000_000_000
 EDGE_TTL_NS = 6_000_000_000
+REQUIRED_UNRECIPROCATED_EDGES = 2
 
 
 def valid_alias(value):
@@ -23,20 +24,18 @@ def valid_alias(value):
     return alias if alias != 0 else None
 
 
-class CpmEnhancedDetector(CamCpmKalmanDetector):
-    def __init__(
-        self, catch_params=None, required_unreciprocated_edges=1,
-        catch_enabled=True,
-    ):
+class TwoEdgeReciprocityDetector(CamCpmKalmanDetector):
+    def __init__(self, catch_params=None, catch_enabled=True):
         super().__init__(catch_params, catch_enabled)
-        self.required_unreciprocated_edges = required_unreciprocated_edges
         self.edges = {}
         self.last_unreciprocated_targets = []
 
     def perceived_object_matches(self, measurement):
         matches = []
         for track in self.tracks:
-            if not nis_prediction_is_fresh(track, int(measurement["rcvTime"])):
+            if not association_prediction_is_fresh(
+                track, int(measurement["rcvTime"])
+            ):
                 continue
             deviation = track.deviation_against_cam(
                 measurement, self.cpm_association_noise
@@ -85,7 +84,7 @@ class CpmEnhancedDetector(CamCpmKalmanDetector):
         self.last_unreciprocated_targets = self.unreciprocated_targets(
             message.get("sender_alias"), now
         )
-        if len(self.last_unreciprocated_targets) >= self.required_unreciprocated_edges:
+        if len(self.last_unreciprocated_targets) >= REQUIRED_UNRECIPROCATED_EDGES:
             # Reject before the normal flow so this message cannot update Kalman state.
             return decision(False, "reciprocity_reject", None, None, None)
         return None
@@ -109,19 +108,16 @@ class CpmEnhancedDetector(CamCpmKalmanDetector):
         return {
             "edge_count": self.edge_count(),
             "unreciprocated_targets": self.last_unreciprocated_targets,
-            "required_unreciprocated_edges": self.required_unreciprocated_edges,
+            "required_unreciprocated_edges": REQUIRED_UNRECIPROCATED_EDGES,
         }
 
 
-def process_cpm_enhanced_folder(
-    input_folder: Path, catch_params, required_unreciprocated_edges=1,
-    catch_enabled=True,
+def process_two_edge_reciprocity_folder(
+    input_folder: Path, catch_params, catch_enabled=True,
 ):
     return process_cam_cpm_kalman_folder(
         input_folder,
         catch_params,
-        lambda params, enabled: CpmEnhancedDetector(
-            params, required_unreciprocated_edges, enabled
-        ),
+        TwoEdgeReciprocityDetector,
         catch_enabled,
     )

@@ -56,9 +56,9 @@ RESULTS = {
 DETECTORS = {
     2: ("CAM Only", "kalman_cam_only"),
     3: ("Tsukada", "kalman_cam_cpm"),
-    4: ("1-Edge Recip.", "kalman_cam_cpm_enhanced"),
-    5: ("2-Edge Recip.", "kalman_cam_cpm_enhanced_two_edges"),
-    6: ("Avg. Weighted Recip.", "kalman_cam_cpm_averaged_reciprocity"),
+    4: ("2-Edge Recip.", "kalman_cam_cpm_enhanced_two_edges"),
+    5: ("Avg. Weighted Recip.", "kalman_cam_cpm_averaged_reciprocity"),
+    6: ("Maintained Trust Recip.", "kalman_cam_cpm_maintained_trust_reciprocity"),
 }
 
 ATTACK_LABELS = {

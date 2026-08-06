@@ -334,7 +334,9 @@ def time_delay_attack(msg: pd.Series):
 
 
 def get_message_cache_key(msg: pd.Series):
-    return msg['type'], msg['sender_id'], msg['messageID']
+    # Synchronized CAM and CPM carry one sender observation and must receive
+    # the same attack realization.
+    return msg['sender_id'], msg['sender_alias'], msg['sendTime']
 
 
 def restore_cached_sender_state(msg: pd.Series, cached_sender: pd.Series):

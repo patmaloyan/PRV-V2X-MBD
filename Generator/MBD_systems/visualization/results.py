@@ -63,6 +63,11 @@ def parse_args():
         action="store_true",
         help="Run Kalman detector types without the CaTCH gate",
     )
+    parser.add_argument(
+        "--skip-runs",
+        action="store_true",
+        help="Plot existing detector outputs without rerunning the detectors",
+    )
     return parser.parse_args()
 
 
@@ -276,9 +281,10 @@ def main():
             if not input_folder.is_dir():
                 raise FileNotFoundError(f"Attack input folder does not exist: {input_folder}")
             for detector_type in args.types:
-                run_detector(
-                    input_folder, detector_type, args.no_pos_check, args.no_catch
-                )
+                if not args.skip_runs:
+                    run_detector(
+                        input_folder, detector_type, args.no_pos_check, args.no_catch
+                    )
                 results[(detector_type, attack)] = load_metrics(
                     setting_root, input_folder, detector_type, args.no_catch
                 )

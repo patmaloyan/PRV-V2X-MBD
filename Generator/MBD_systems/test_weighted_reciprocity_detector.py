@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from weighted_reciprocity_detector import (
     CPM_SENSOR_RANGE_M,
+    MIN_TRUST_UPDATES,
     RECIPROCITY_NIS_THRESHOLD,
     EdgeEvidence,
     MaintainedTrustReciprocityDetector,
@@ -248,11 +249,28 @@ class MaintainedTrustStateTests(unittest.TestCase):
         self.assertEqual(result["evidence_counts"][1], 1)
         self.assertEqual(result["normalized_scores"][1], -0.5)
         self.assertAlmostEqual(self.detector.trust[1].score, -1.0 / 6.0)
+        self.assertEqual(self.detector.trust[1].evidence_updates, 1)
+        self.assertTrue(self.detector.trust[1].accepted)
+
+    def test_requires_three_evidence_updates_before_quarantine(self):
+        self.detector.bucket_edges[(1, 2)] = edge_evidence(0.0, 0.0)
+
+        for expected_updates in range(1, MIN_TRUST_UPDATES):
+            self.detector.close_current_bucket()
+            self.assertEqual(
+                self.detector.trust[1].evidence_updates, expected_updates
+            )
+            self.assertTrue(self.detector.trust[1].accepted)
+
+        self.detector.close_current_bucket()
+        self.assertEqual(
+            self.detector.trust[1].evidence_updates, MIN_TRUST_UPDATES
+        )
         self.assertFalse(self.detector.trust[1].accepted)
 
     def test_no_evidence_does_not_change_trust_or_state(self):
         self.detector.trust[1] = MaintainedVehicleTrust(
-            accepted=False, score=-0.25
+            accepted=False, score=-0.25, evidence_updates=MIN_TRUST_UPDATES
         )
 
         result = self.detector.close_current_bucket()
@@ -263,7 +281,7 @@ class MaintainedTrustStateTests(unittest.TestCase):
 
     def test_positive_evidence_allows_reentry_at_zero(self):
         self.detector.trust[1] = MaintainedVehicleTrust(
-            accepted=False, score=-0.25
+            accepted=False, score=-0.25, evidence_updates=MIN_TRUST_UPDATES
         )
         self.detector.bucket_edges[(2, 1)] = edge_evidence(0.0, 0.0)
 

@@ -125,7 +125,7 @@ def main():
         "--type",
         type=int,
         choices=[*range(7), 20, 100],
-        help="0 = catch-checks, 1 = legacy checks, 2 = CAM-only Kalman, 3 = CAM+CPM Kalman, 4 = two-edge reciprocal CPM Kalman, 5 = three-score average reciprocity, 6 = maintained-trust reciprocity, 20 = maintained trust without anonymous CPM tracks, 100 = alias-aware catch",
+        help="0 = catch-checks, 1 = legacy checks, 2 = CAM-only Kalman, 3 = CAM+CPM Kalman, 4 = two-edge reciprocal CPM Kalman, 5 = three-score average reciprocity, 6 = PRV, 20 = maintained trust without anonymous CPM tracks, 100 = alias-aware catch",
         required=True,
     )
     parser.add_argument(
@@ -362,6 +362,7 @@ def main():
             "nis_threshold", "known_alias_nis_threshold",
             "max_kalman_prediction_gap_s", "max_association_prediction_gap_s",
             "reciprocity_nis_threshold",
+            "minimum_trust_updates",
             "process_noise_intensity",
             "total_messages", "cam_messages", "cpm_messages",
             "evaluated_receivers", "excluded_attacker_receivers",
@@ -371,7 +372,7 @@ def main():
         print(aggregated_metrics['f1'])
 
         if args.train == 0:
-            result_name = "kalman_cam_cpm_maintained_trust_reciprocity" + (
+            result_name = "kalman_cam_cpm_prv" + (
                 "" if catch_enabled else "_no_catch"
             )
             output_dir = result_directory(input_folder, result_name)

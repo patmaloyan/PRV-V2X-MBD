@@ -21,7 +21,7 @@ DETECTORS = {
     3: ("Tsukada", "kalman_cam_cpm"),
     4: ("2-Edge Recip.", "kalman_cam_cpm_enhanced_two_edges"),
     5: ("Avg. Weighted Recip.", "kalman_cam_cpm_averaged_reciprocity"),
-    6: ("Maintained Trust Recip.", "kalman_cam_cpm_maintained_trust_reciprocity"),
+    6: ("PRV", "kalman_cam_cpm_prv"),
     20: ("Trust Recip. (No Anon.)", "kalman_cam_cpm_maintained_trust_no_anonymous"),
 }
 
@@ -41,6 +41,11 @@ def parse_args():
         help="Output filename suffix; the setting is added as a prefix",
     )
     parser.add_argument("--setting", default="urban", help="Simulation setting, such as urban or highway")
+    parser.add_argument(
+        "--setting-root",
+        type=Path,
+        help="Explicit Simulation-Test folder (overrides the folder derived from --setting)",
+    )
     parser.add_argument("--types", nargs="+", type=int, default=[2, 3, 4, 6], help="Detector types (2-6, 20, 100)")
     parser.add_argument(
         "--attacks",
@@ -271,7 +276,11 @@ def main():
     args = parse_args()
     try:
         validate_args(args)
-        setting_root = REPO_ROOT / "Simulation-Test" / f"{args.setting}-test"
+        setting_root = (
+            args.setting_root.resolve()
+            if args.setting_root is not None
+            else REPO_ROOT / "Simulation-Test" / f"{args.setting}-test"
+        )
         if not setting_root.is_dir():
             raise FileNotFoundError(f"Setting folder does not exist: {setting_root}")
 

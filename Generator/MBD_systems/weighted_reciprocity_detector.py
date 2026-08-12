@@ -1,4 +1,4 @@
-"""Type 6: weighted reciprocal CPM checks in one-second intervals."""
+"""PRV (Type 6): weighted reciprocal CPM checks in one-second intervals."""
 
 from collections import deque
 from dataclasses import dataclass, field
@@ -31,6 +31,7 @@ RECIPROCITY_INBOUND_ONLY_COEFFICIENT = 1.0
 RECIPROCITY_OUTBOUND_ONLY_COEFFICIENT = -2.0
 MAINTAINED_TRUST_OUTBOUND_ONLY_COEFFICIENT = -1.0
 TRUST_ALPHA = 1.0 / 3.0
+MIN_TRUST_UPDATES = 3
 MAX_PAIR_SCORE_MAGNITUDE = 2.0
 RECIPROCITY_NIS_THRESHOLD = 18.47
 
@@ -56,6 +57,7 @@ class VehicleTrust:
 class MaintainedVehicleTrust:
     accepted: bool = True
     score: float = 0.0
+    evidence_updates: int = 0
 
 
 def nis_confidence(nis):
@@ -331,6 +333,10 @@ class WeightedReciprocityDetector(CamCpmKalmanDetector):
                     self.decision_score(source_state)
                     if source_state is not None else 0.0
                 ),
+                "reciprocity_evidence_updates": (
+                    getattr(source_state, "evidence_updates", 0)
+                    if source_state is not None else 0
+                ),
                 "closed_reciprocity_intervals": self.last_closed_intervals,
             })
 
@@ -383,7 +389,7 @@ def process_weighted_reciprocity_folder(
 
 
 class MaintainedTrustReciprocityDetector(WeightedReciprocityDetector):
-    """Type 6: EWMA trust over normalized one-second reciprocity evidence."""
+    """Type 6 (PRV): EWMA trust over normalized one-second reciprocity evidence."""
 
     def track_id(self, track, create_trust=False):
         key = id(track)
@@ -430,7 +436,11 @@ class MaintainedTrustReciprocityDetector(WeightedReciprocityDetector):
             was_accepted = state.accepted
             if normalized_score is not None:
                 state.score += TRUST_ALPHA * (normalized_score - state.score)
-                state.accepted = state.score >= 0.0
+                state.evidence_updates += 1
+                state.accepted = (
+                    state.evidence_updates < MIN_TRUST_UPDATES
+                    or state.score >= 0.0
+                )
             trust_scores[track_id] = state.score
             if state.accepted != was_accepted:
                 transitions.append({
@@ -444,6 +454,10 @@ class MaintainedTrustReciprocityDetector(WeightedReciprocityDetector):
             "normalized_scores": normalized_scores,
             "evidence_counts": evidence_counts,
             "trust_scores": trust_scores,
+            "trust_update_counts": {
+                track_id: state.evidence_updates
+                for track_id, state in self.trust.items()
+            },
             "transitions": transitions,
         }
 
@@ -465,6 +479,7 @@ def process_maintained_trust_reciprocity_folder(
         catch_enabled,
     )
     metrics["reciprocity_nis_threshold"] = RECIPROCITY_NIS_THRESHOLD
+    metrics["minimum_trust_updates"] = MIN_TRUST_UPDATES
     return metrics, results
 
 

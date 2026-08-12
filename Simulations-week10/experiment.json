@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "container": {
+    "image": "ghcr.io/vs-uulm/veremi-nextgen:recreation@sha256:cdddb6e0ddcb350f9fb3602128b8fa046ecc0b5699082566cdb4ff01db68d4b8",
+    "digest": "sha256:cdddb6e0ddcb350f9fb3602128b8fa046ecc0b5699082566cdb4ff01db68d4b8",
+    "watchdog_seconds": 0
+  },
+  "source_scenario": "Generator/simulation/mosaic-7-28/scenarios/InTAS_urban_7_9",
+  "application_project": "Simulations-week10/CamApp",
+  "application_database": "Generator/simulation/mosaic-week9/scenarios/urban/application/InTAS.db",
+  "active_simulation_seeds": ["1"],
+  "simulation_seeds": {
+    "1": {"mosaic": 268965854, "sumo": 268965854, "omnet": 1},
+    "2": {"mosaic": 268965855, "sumo": 268965855, "omnet": 2},
+    "3": {"mosaic": 268965856, "sumo": 268965856, "omnet": 3}
+  },
+  "attack_seeds": [1, 2, 3],
+  "attacks": ["constantPositionOffset", "randomPositionOffset"],
+  "attack_ratio": 0.2,
+  "simulation_jobs": 1,
+  "attack_jobs": 3,
+  "scenarios": {
+    "InTAS_urban_2AM_300sec": {
+      "area": "urban",
+      "communication_start": 7200,
+      "communication_end": 7500,
+      "bounds": {"minX": 48.756441, "minY": 11.410236, "maxX": 48.773643, "maxY": 11.436188}
+    },
+    "InTAS_urban_7AM_300sec": {
+      "area": "urban",
+      "communication_start": 25200,
+      "communication_end": 25500,
+      "bounds": {"minX": 48.756441, "minY": 11.410236, "maxX": 48.773643, "maxY": 11.436188}
+    },
+    "InTAS_highway_2AM_300sec": {
+      "area": "highway",
+      "communication_start": 7200,
+      "communication_end": 7500,
+      "bounds": {"minX": 48.749772, "minY": 11.453732, "maxX": 48.767821, "maxY": 11.463387}
+    },
+    "InTAS_highway_7AM_300sec": {
+      "area": "highway",
+      "communication_start": 25200,
+      "communication_end": 25500,
+      "bounds": {"minX": 48.749772, "minY": 11.453732, "maxX": 48.767821, "maxY": 11.463387}
+    }
+  }
+}

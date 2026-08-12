@@ -33,6 +33,8 @@ parser = argparse.ArgumentParser(description="Sort a JSON array by sendTime.")
 parser.add_argument("input_folder", help="Path to the input files")
 parser.add_argument("misbehavior", help="Specify the misbehavior")
 parser.add_argument("sumoConf", help="Path to the scenario .sumocfg file")
+parser.add_argument("--seed", type=int, help="Seed Python and NumPy randomness for a reproducible attack dataset")
+parser.add_argument("--output-dir", type=Path, help="Write the attacked dataset to this directory")
 args = parser.parse_args()
 
 input_folder = Path(args.input_folder)
@@ -1016,12 +1018,16 @@ def set_up_misbehavior_config():
 
 # Main execution
 if __name__ == "__main__":
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+
     df_all = pd.DataFrame()
     misbehavior_config = dict()
     messages_lookup = {}
     sender_lookup = {}
     misbehavior_config['ratio'] = ATTACK_RATIO
-    output_dir = input_folder.parent / f"{input_folder.name}_{args.misbehavior}"
+    output_dir = args.output_dir if args.output_dir is not None else input_folder.parent / f"{input_folder.name}_{args.misbehavior}"
     # CPM-addition: support datasets split into cam/ and cpm/ folders.
     cam_input_dir = input_folder / 'cam' if (input_folder / 'cam').is_dir() else input_folder
     cpm_input_dir = input_folder / 'cpm' if (input_folder / 'cpm').is_dir() else None

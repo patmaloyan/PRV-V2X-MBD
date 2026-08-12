@@ -36,25 +36,46 @@ produces synchronization steps longer than both the image's 30-second default
 and a tested five-minute threshold. Exact stop-time and completion-code checks
 still prevent an interrupted or incomplete run from being promoted.
 
+## Fresh-machine setup
+
+The runner targets Linux or WSL2 and requires Docker, Python 3.12 or newer,
+JDK 17 or newer, and Maven. Docker must be available to the current user
+without an interactive `sudo` prompt. From the repository root, create the
+ignored local Python environment and pull the pinned simulation image:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r Simulations-week10/requirements.txt
+
+docker pull \
+  ghcr.io/vs-uulm/veremi-nextgen:recreation@sha256:cdddb6e0ddcb350f9fb3602128b8fa046ecc0b5699082566cdb4ff01db68d4b8
+```
+
+Do not commit `.venv`; `requirements.txt` is the reproducible description of
+its pipeline dependencies. The pipeline uses GNU `cp --reflink=auto`, Linux
+user/group IDs, and Docker bind mounts, so native Windows and macOS hosts are
+not currently supported directly.
+
 ## Commands
 
 Run commands from the repository root:
 
 ```bash
 # Build the week-10 app, prepare all active scenarios, and validate configuration.
-python3 Simulations-week10/run_week10.py validate
+.venv/bin/python Simulations-week10/run_week10.py validate
 
 # Short end-to-end Docker run. This does not create a production dataset.
-python3 Simulations-week10/run_week10.py smoke
+.venv/bin/python Simulations-week10/run_week10.py smoke
 
 # Run production simulations sequentially (the safe default for dense 7 AM traffic).
-python3 Simulations-week10/run_week10.py simulate
+.venv/bin/python Simulations-week10/run_week10.py simulate
 
 # Generate the 24 attacked datasets after clean simulations finish.
-python3 Simulations-week10/run_week10.py attack
+.venv/bin/python Simulations-week10/run_week10.py attack
 
 # Run missing clean simulations and then all attacks.
-python3 Simulations-week10/run_week10.py all
+.venv/bin/python Simulations-week10/run_week10.py all
 ```
 
 Use `--settings`, `--simulation-seeds`, `--attacks`, and `--attack-seeds` to
@@ -66,10 +87,10 @@ runner never silently overwrites them.
 Examples:
 
 ```bash
-python3 Simulations-week10/run_week10.py simulate \
+.venv/bin/python Simulations-week10/run_week10.py simulate \
   --settings InTAS_highway_2AM_300sec --simulation-seeds 1 --jobs 1
 
-python3 Simulations-week10/run_week10.py attack \
+.venv/bin/python Simulations-week10/run_week10.py attack \
   --settings InTAS_highway_2AM_300sec \
   --attacks constantPositionOffset --attack-seeds 1 --jobs 1
 ```
@@ -97,4 +118,5 @@ discards only that incomplete staging directory. Completed datasets should be
 retained as immutable paper artifacts.
 
 Generated scenarios, datasets, logs, and build/runtime work are ignored by Git.
-Commit the manifest, runner, week-10 application source, tests, and this README.
+Commit the manifest, runner, dependency requirements, week-10 application
+source, tests, and this README.

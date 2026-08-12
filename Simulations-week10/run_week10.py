@@ -28,7 +28,7 @@ CLEAN_ROOT = HERE / "seeded-simulations-300sec"
 ATTACK_ROOT = HERE / "attacks"
 LOG_ROOT = HERE / "run-logs"
 ATTACK_GENERATOR = REPO / "Generator/attackGenerator/attackGenerator.py"
-ATTACK_PYTHON = REPO / ".venv/bin/python"
+ATTACK_PYTHON = Path(sys.executable)
 
 
 class PipelineError(RuntimeError):
@@ -230,13 +230,14 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
         raise PipelineError("Conference attack list changed unexpectedly")
     if float(manifest["attack_ratio"]) != 0.2:
         raise PipelineError("Conference attack ratio must remain 0.2")
-    if not ATTACK_PYTHON.is_file():
-        raise PipelineError(f"Repository Python environment is missing: {ATTACK_PYTHON}")
     dependency_check = subprocess.run(
         [str(ATTACK_PYTHON), "-c", "import numpy, pandas, traci"], check=False
     )
     if dependency_check.returncode:
-        raise PipelineError("The repository Python environment lacks numpy, pandas, or traci")
+        raise PipelineError(
+            "The active Python environment lacks numpy, pandas, or traci; "
+            "install Simulations-week10/requirements.txt"
+        )
 
 
 def validate_prepared_scenario(
